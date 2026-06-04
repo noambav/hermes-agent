@@ -24,6 +24,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -35,6 +36,35 @@ pytestmark = pytest.mark.skipif(
     sys.platform.startswith("win") or shutil.which("bash") is None,
     reason="POSIX shell required to drive node-bootstrap.sh",
 )
+
+
+class _Layout(NamedTuple):
+    home: Path
+    hermes_home: Path
+    node_bin: Path
+    prefix: Path
+    link_dir: Path
+    local_bin: Path
+
+
+def _layout(tmp_path: Path) -> _Layout:
+    """The fixed dir layout these tests share.
+
+    Termux mode (PREFIX contains ``com.termux/files/usr``) makes the link dir
+    ``$PREFIX/bin``, so ``~/.local/bin`` is a *scanned, writable* stale dir —
+    the only way to exercise the relink+prune without being root.
+    """
+    home = tmp_path / "home"
+    hermes_home = tmp_path / "hermes"
+    prefix = tmp_path / "termux" / "com.termux" / "files" / "usr"
+    return _Layout(
+        home=home,
+        hermes_home=hermes_home,
+        node_bin=hermes_home / "node" / "bin",
+        prefix=prefix,
+        link_dir=prefix / "bin",
+        local_bin=home / ".local" / "bin",
+    )
 
 
 def _make_bundled_node(hermes_home: Path) -> Path:
@@ -55,18 +85,14 @@ def _run_nb_link(tmp_path: Path, *, extra: str = "") -> subprocess.CompletedProc
     abort (the #38889 hardening); ``SENTINEL_OK`` after the call proves we
     returned normally.
     """
-    home = tmp_path / "home"
-    hermes_home = tmp_path / "hermes"
-    # Termux PREFIX → link dir becomes $PREFIX/bin, so ~/.local/bin is a
-    # *scanned* (writable) stale dir rather than the link dir itself.
-    prefix = tmp_path / "termux" / "com.termux" / "files" / "usr"
-    (prefix / "bin").mkdir(parents=True, exist_ok=True)
-    (home / ".local" / "bin").mkdir(parents=True, exist_ok=True)
+    lay = _layout(tmp_path)
+    lay.link_dir.mkdir(parents=True, exist_ok=True)
+    lay.local_bin.mkdir(parents=True, exist_ok=True)
 
     env = {
-        "HOME": str(home),
-        "PREFIX": str(prefix),
-        "HERMES_HOME": str(hermes_home),
+        "HOME": str(lay.home),
+        "PREFIX": str(lay.prefix),
+        "HERMES_HOME": str(lay.hermes_home),
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
     }
     script = textwrap.dedent(
@@ -86,11 +112,10 @@ def _run_nb_link(tmp_path: Path, *, extra: str = "") -> subprocess.CompletedProc
 def test_relinks_and_prunes_stale_hermes_shadows(tmp_path: Path) -> None:
     """node/npm links into the bundle's node dir are pruned; the canonical link
     dir gets fresh links; non-hermes links and real files are left alone."""
-    home = tmp_path / "home"
-    hermes_home = tmp_path / "hermes"
-    node_bin = _make_bundled_node(hermes_home)
-    link_dir = tmp_path / "termux" / "com.termux" / "files" / "usr" / "bin"
-    local_bin = home / ".local" / "bin"
+    lay = _layout(tmp_path)
+    node_bin = _make_bundled_node(lay.hermes_home)
+    link_dir = lay.link_dir
+    local_bin = lay.local_bin
 
     # Simulate an old/broken install: hermes-owned shadow links in ~/.local/bin.
     local_bin.mkdir(parents=True, exist_ok=True)
@@ -126,9 +151,9 @@ def test_relinks_and_prunes_stale_hermes_shadows(tmp_path: Path) -> None:
 
 def test_idempotent_across_repeated_runs(tmp_path: Path) -> None:
     """Running the heal twice converges to the same state (no thrash/dup)."""
-    hermes_home = tmp_path / "hermes"
-    node_bin = _make_bundled_node(hermes_home)
-    link_dir = tmp_path / "termux" / "com.termux" / "files" / "usr" / "bin"
+    lay = _layout(tmp_path)
+    node_bin = _make_bundled_node(lay.hermes_home)
+    link_dir = lay.link_dir
 
     first = _run_nb_link(tmp_path)
     assert first.returncode == 0, first.stderr
@@ -145,10 +170,9 @@ def test_idempotent_across_repeated_runs(tmp_path: Path) -> None:
 def test_prune_failure_does_not_abort_under_set_e(tmp_path: Path) -> None:
     """A non-removable stale shadow (read-only parent dir) must NOT abort the
     caller under ``set -e`` — the #38889 prune-abort hardening."""
-    home = tmp_path / "home"
-    hermes_home = tmp_path / "hermes"
-    node_bin = _make_bundled_node(hermes_home)
-    local_bin = home / ".local" / "bin"
+    lay = _layout(tmp_path)
+    node_bin = _make_bundled_node(lay.hermes_home)
+    local_bin = lay.local_bin
     local_bin.mkdir(parents=True)
     (local_bin / "node").symlink_to(node_bin / "node")  # hermes shadow to prune
 
