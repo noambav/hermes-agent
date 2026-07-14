@@ -195,6 +195,14 @@ def wait_for_container_ready(
     Raises ``TimeoutError`` if the container never becomes ready — much
     better than a fixed ``time.sleep()`` that either wastes time on fast
     machines or flakes on slow ones.
+
+    Note: an earlier iteration tried a single blocking ``docker exec``
+    with an in-container ``until`` loop to eliminate polling overhead.
+    That was a net regression on CI: the per-``docker exec`` connection
+    overhead on shared runners (~0.7–1s) is higher than the cost of
+    3–7 quick poll calls (0.27s each), so the blocking approach traded
+    fewer calls for longer per-call duration and lost. The poll loop
+    is kept because it's better suited to CI's docker exec cost profile.
     """
     end = time.monotonic() + deadline_s
     while time.monotonic() < end:
