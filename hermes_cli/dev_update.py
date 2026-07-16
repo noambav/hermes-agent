@@ -113,30 +113,14 @@ def _git(
 
 
 def _git_porcelain_status(cwd: Path) -> str:
-    """Return ``git status --porcelain`` output, excluding infrastructure.
+    """Return raw ``git status --porcelain`` output.
 
-    The .worktrees/ directory and the .gitignore entry that excludes it
-    are infrastructure created by the worktree switch — not user changes.
-    The byte-identical assertion checks that the user's changes are
-    untouched, not that git didn't create its own infrastructure.
+    No filtering — the repo already ignores ``.worktrees/`` via its own
+    ``.gitignore``.  Comparing raw status ensures the user's tree is left
+    exactly unchanged by the worktree switch.
     """
     result = _git(["status", "--porcelain"], cwd, capture=True)
-    lines = []
-    for line in result.stdout.splitlines():
-        stripped = line.strip()
-        # Exclude .worktrees/ directory entries
-        if ".worktrees/" in stripped or stripped.endswith(".worktrees/"):
-            continue
-        # Exclude a root .gitignore that only contains .worktrees/ (created
-        # by _ensure_worktrees_gitignored)
-        if stripped == "?? .gitignore":
-            gitignore_path = cwd / ".gitignore"
-            if gitignore_path.exists():
-                content = gitignore_path.read_text().strip()
-                if content == ".worktrees/" or content == ".worktrees":
-                    continue
-        lines.append(line)
-    return "\n".join(lines) + ("\n" if lines else "")
+    return result.stdout
 
 
 def _is_dirty(cwd: Path) -> bool:
@@ -291,30 +275,6 @@ def _fast_forward_in_place(
 # Core: create a worktree
 # ---------------------------------------------------------------------------
 
-def _ensure_worktrees_gitignored(tree_root: Path) -> None:
-    """Ensure ``.worktrees/`` is in ``.gitignore``.
-
-    Without this, ``git status --porcelain`` picks up the newly-created
-    ``.worktrees/`` directory as untracked, breaking the byte-identical
-    status invariant.  This is idempotent: if the entry already exists,
-    it's a no-op.
-    """
-    gitignore = tree_root / ".gitignore"
-    entry = ".worktrees/"
-    try:
-        if gitignore.is_file():
-            content = gitignore.read_text(encoding="utf-8")
-            if entry not in content.splitlines():
-                gitignore.write_text(
-                    content.rstrip("\n") + f"\n{entry}\n",
-                    encoding="utf-8",
-                )
-        else:
-            gitignore.write_text(f"{entry}\n", encoding="utf-8")
-    except OSError:
-        pass  # Non-fatal — the invariant check will catch it
-
-
 def _create_worktree(
     tree_root: Path,
     target_name: str,
@@ -327,9 +287,6 @@ def _create_worktree(
 
     Raises ``RuntimeError`` if worktree creation fails.
     """
-    # Ensure .worktrees/ is gitignored so it doesn't show up in git status
-    _ensure_worktrees_gitignored(tree_root)
-
     wt_path = _worktree_dir(tree_root, target_name)
     # Always pass an absolute path (pitfall: relative paths from a linked
     # worktree land relative to the main checkout's .worktrees only if
@@ -457,10 +414,6 @@ def run_dev_update(
             return result
 
     # --- Dirty tree: offer the 3-option choice ---
-    # Ensure .worktrees/ is gitignored before capturing status, so the
-    # worktree directory doesn't pollute the byte-identical status invariant.
-    _ensure_worktrees_gitignored(tree_root)
-
     # Capture git status before any action (for byte-identical assertion)
     status_before = _git_porcelain_status(tree_root)
 

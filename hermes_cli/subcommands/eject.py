@@ -292,11 +292,13 @@ def cmd_eject(args) -> None:
         _run_dev_sync(dest_dir)
     except Exception as exc:
         print(
-            f"\nWarning: hermes dev sync failed: {exc}\n"
+            f"\nError: hermes dev sync failed: {exc}\n"
             f"The checkout has been cloned but not fully provisioned.\n"
-            f"Run `hermes dev sync` inside {dest_dir} to complete setup.",
+            f"Run `hermes dev sync` inside {dest_dir} to complete setup,\n"
+            f"then re-run `hermes eject` to activate the checkout.",
             file=sys.stderr,
         )
+        sys.exit(1)
 
     # --- 3. Re-point the PATH symlink ---
     launcher_path = dest_dir / _BIN_HERMES

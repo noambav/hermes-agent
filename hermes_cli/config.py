@@ -3150,7 +3150,7 @@ DEFAULT_CONFIG = {
         # pristine installs — both at launch and when `hermes update` is run
         # on a clean-main checkout; "prompt" shows the offer once per 7 days;
         # "never" silences the offer entirely.
-        "adopt": "auto",
+        "adopt": "prompt",
     },
 
     # Language Server Protocol — semantic diagnostics from real

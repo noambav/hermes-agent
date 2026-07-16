@@ -149,14 +149,15 @@ def offer_adoption(
             return
 
         if adopt_mode == "auto" and info.pristine:
-            # Auto-invoke adopt (interactive or not)
-            import subprocess
+            # Auto-invoke adopt — replace this process, never return.
+            # Using os.execv ensures the adoption updater takes over
+            # completely; the old Python process doesn't continue booting
+            # alongside the adoption mutation.
+            import os
+            import sys
 
             print("→ Auto-adopting to managed release bundles...")
-            subprocess.Popen(
-                ["hermes", "adopt", "--yes"],
-                start_new_session=True,
-            )
+            os.execvp("hermes", ["hermes", "adopt", "--yes"])
         else:
             # Show the offer text
             print(ADOPT_PROMPT_COPY)

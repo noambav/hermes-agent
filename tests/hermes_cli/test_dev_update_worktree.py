@@ -49,6 +49,7 @@ def _make_repo(path: Path) -> Path:
     _git("config", "user.email", "test@example.com", cwd=path)
     _git("config", "user.name", "Test", cwd=path)
     (path / "README.md").write_text("# Test Repo\n")
+    (path / "pyproject.toml").write_text('[project]\nname = "test"\nversion = "0.1.0"\n')
     (path / ".gitignore").write_text(".worktrees/\n")
     _git("add", ".", cwd=path)
     _git("commit", "-qm", "initial commit", cwd=path)

@@ -765,6 +765,9 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
 
     missing = feature_missing(feature)
     if not missing:
+        # Deps already satisfied — but still record intent so the feature
+        # survives venv replacement (e.g. installed via [all] or a bundle).
+        record_feature(feature, via="ensure")
         return
 
     unsupported = _unsupported_feature_reason(feature)
@@ -1150,6 +1153,32 @@ def record_feature(name: str, via: str) -> None:
         logger.debug("Failed to record feature %r in ledger: %s", name, e)
 
 
+def _merge_pending_if_present() -> None:
+    """Merge ``features.pending.json`` into ``features.json`` if it exists.
+
+    This runs regardless of whether the ledger already exists — the pending
+    file may have been written by phase-2 adopt after the ledger was seeded.
+    After merging, the pending file is consumed (deleted).
+    """
+    pending_path = _ledger_pending_path()
+    if not pending_path.exists():
+        return
+    try:
+        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        if isinstance(pending, dict):
+            data = _read_ledger()
+            for feat, entry in (pending.get("features") or {}).items():
+                if isinstance(entry, dict):
+                    data["features"][feat] = entry
+            _write_ledger(data)
+    except (json.JSONDecodeError, OSError):
+        pass
+    try:
+        pending_path.unlink()
+    except OSError:
+        pass
+
+
 def ledger_features() -> list[str]:
     """Return the list of feature names recorded in the activation ledger.
 
@@ -1160,6 +1189,9 @@ def ledger_features() -> list[str]:
     path = _ledger_path()
     if not path.exists():
         return _seed_ledger_from_probe()
+    # Even if the ledger exists, there may be a pending file from a
+    # phase-2 adopt that ran after seeding — merge it now.
+    _merge_pending_if_present()
     return list(_read_ledger().get("features", {}).keys())
 
 

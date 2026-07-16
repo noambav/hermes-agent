@@ -44,10 +44,23 @@ _REGISTRY: dict[str, ProviderProfile] = {}
 _ALIASES: dict[str, str] = {}
 _discovered = False
 
-# Repo-root ``plugins/model-providers/`` — populated at discovery time.
+# Bundled model-provider plugins — resolved via artifact root so it works
+# in both slots (app/plugins/model-providers) and checkouts (plugins/model-providers).
 _BUNDLED_PLUGINS_DIR = (
     Path(__file__).resolve().parent.parent / "plugins" / "model-providers"
+    if not Path(__file__).resolve().parent.name == "site-packages"
+    else Path(__file__).resolve().parent.parent.parent.parent / "app" / "plugins" / "model-providers"
 )
+
+# Try artifact-root-aware resolution (preferred for slots)
+try:
+    from hermes_constants import get_artifact_root
+    _BUNDLED_PLUGINS_DIR = get_artifact_root() / "app" / "plugins" / "model-providers"
+    if not _BUNDLED_PLUGINS_DIR.is_dir():
+        # Checkout layout: plugins/ at repo root
+        _BUNDLED_PLUGINS_DIR = get_artifact_root() / "plugins" / "model-providers"
+except Exception:
+    pass  # Fallback to __file__-relative path above
 
 
 def register_provider(profile: ProviderProfile) -> None:

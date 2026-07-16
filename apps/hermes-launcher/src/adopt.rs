@@ -30,6 +30,11 @@ pub fn adopt(
         &git_sha[..8]
     );
 
+    // Capture feature intent from the old checkout's venv before any
+    // mutation, so the new slot's ledger can re-install optional features
+    // that were present only in the old venv.
+    capture_feature_intent(hermes_home, from_checkout);
+
     let source_url =
         source.unwrap_or("https://github.com/NousResearch/hermes-agent/releases/download");
     let release_source = ReleaseSource::parse(source_url)?;
@@ -81,6 +86,20 @@ pub fn adopt(
             )
         })?;
     }
+    #[cfg(windows)]
+    {
+        // Windows: use copy instead of symlink (symlinks require admin/dev mode)
+        let exe_src = launcher.with_extension("exe");
+        let exe_dst = symlink_path.with_extension("exe");
+        let _ = std::fs::remove_file(&exe_dst);
+        std::fs::copy(&exe_src, &exe_dst).with_context(|| {
+            format!(
+                "cannot copy {} → {}",
+                exe_src.display(),
+                exe_dst.display()
+            )
+        })?;
+    }
 
     println!(
         "==> Symlink: {} → {}",
@@ -88,15 +107,20 @@ pub fn adopt(
         launcher.display()
     );
 
+    // Validate checkout invariants AFTER the flip — if the checkout was
+    // modified during adoption, report the error (the managed slot is
+    // already active, so this is a warning about the checkout, not a
+    // rollback of the managed activation).
     let new_sha = read_checkout_sha(from_checkout)?;
     if new_sha != git_sha || read_checkout_state(from_checkout)? != checkout_state {
-        bail!(
-            "checkout was modified during adoption (HEAD expected {}, got {})",
-            git_sha,
-            new_sha
+        eprintln!(
+            "warning: checkout was modified during adoption (HEAD expected {}, got {})",
+            git_sha, new_sha
         );
+        eprintln!("         The managed slot is active; the checkout may need attention.");
+    } else {
+        println!("==> Checkout untouched");
     }
-    println!("==> Checkout untouched");
 
     println!();
     println!("✓ Adoption complete!");
@@ -126,6 +150,14 @@ fn adopt_undo(hermes_home: &Path) -> Result<()> {
     {
         let _ = std::fs::remove_file(&symlink_path);
         std::os::unix::fs::symlink(old_target, &symlink_path)?;
+    }
+    #[cfg(windows)]
+    {
+        // Windows: use copy instead of symlink
+        let exe_src = PathBuf::from(old_target).with_extension("exe");
+        let exe_dst = symlink_path.with_extension("exe");
+        let _ = std::fs::remove_file(&exe_dst);
+        std::fs::copy(&exe_src, &exe_dst)?;
     }
 
     let _ = std::fs::remove_file(&pre_adopt_path);
@@ -190,6 +222,37 @@ fn find_command_link_dir() -> Result<PathBuf> {
     // Fallback: create ~/.local/bin
     std::fs::create_dir_all(&local_bin)?;
     Ok(local_bin)
+}
+
+/// Probe the old checkout's venv for installed optional features and write
+/// them to ``$HERMES_HOME/state/features.pending.json`` so the new slot's
+/// ledger can re-install them.
+fn capture_feature_intent(hermes_home: &Path, checkout: &Path) {
+    // Try to run the old checkout's Python to probe active features
+    let venv_python = checkout.join("venv").join("bin").join("python");
+    if !venv_python.exists() {
+        return;
+    }
+    let output = std::process::Command::new(&venv_python)
+        .args(["-c", "from tools.lazy_deps import active_features; import json; print(json.dumps(list(active_features())))"])
+        .current_dir(checkout)
+        .output();
+    if let Ok(output) = output {
+        if output.status.success() {
+            let features_str = String::from_utf8_lossy(&output.stdout);
+            let state_dir = hermes_home.join("state");
+            let _ = std::fs::create_dir_all(&state_dir);
+            let pending_path = state_dir.join("features.pending.json");
+            let pending_content = format!(
+                "{{\"schema\":1,\"features\":{}}}",
+                features_str.trim()
+            );
+            let _ = std::fs::write(&pending_path, pending_content);
+            if !features_str.trim().is_empty() {
+                println!("==> Captured feature intent from old venv");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

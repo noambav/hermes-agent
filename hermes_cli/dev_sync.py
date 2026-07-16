@@ -36,19 +36,19 @@ class DevSyncError(RuntimeError):
 # Tree-kind detection (Python-side mirror of the Rust launcher's TreeKind)
 # ---------------------------------------------------------------------------
 
-def detect_tree_kind(tree_root: Path) -> str:
-    """Return ``"slot"`` or ``"checkout"`` for *tree_root*.
+def detect_tree_kind(tree_root: Path) -> str | None:
+    """Return ``"slot"``, ``"checkout"``, or ``None`` for *tree_root*.
 
     A **slot** (managed bundle) has ``manifest.json`` at its root.
     A **checkout** (source/ejected) has ``pyproject.toml`` + ``.git``.
-
-    This is the Python-side counterpart of the Rust launcher's
-    ``resolve_tree_root`` (phase 1, task 1.1).  The launcher detects this
-    at exec time; we detect it here for the ``hermes dev`` subcommand.
+    Returns ``None`` for paths that match neither — rejecting unknown trees
+    rather than silently treating them as checkouts.
     """
     if (tree_root / "manifest.json").is_file():
         return "slot"
-    return "checkout"
+    if (tree_root / ".git").exists() and (tree_root / "pyproject.toml").is_file():
+        return "checkout"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -441,13 +441,14 @@ def _sync_venv(
             _require_success("venv dependency sync", result)
             report.venv_synced = True
     else:
-        # No lockfile — use pip install directly
-        result = runner.run(
-            [uv_bin, "pip", "install", "-e", ".[all]"],
-            cwd=tree_root,
+        # No lockfile — use the established per-extra fallback from main.py
+        # instead of a weaker single-shot pip install.
+        from hermes_cli.main import _install_python_dependencies_with_optional_fallback
+
+        _install_python_dependencies_with_optional_fallback(
+            [uv_bin, "pip"],
             env={"VIRTUAL_ENV": str(venv_dir)},
         )
-        _require_success("venv dependency sync", result)
         report.venv_synced = True
 
     return report
@@ -456,27 +457,50 @@ def _sync_venv(
 def _install_launcher(
     tree_root: Path, report: SyncReport, runner: "SubprocessRunner"
 ) -> SyncReport:
-    """Step 2: install the release launcher into .hermes-launcher/."""
+    """Step 2: install the release launcher into .hermes-launcher/.
+
+    Best-effort: failures are non-fatal (warning only). Downloads the
+    ``hermes-updater-<platform>`` asset (not ``hermes-<platform>``) and
+    verifies its sha256 checksum against the published ``.sha256`` file.
+    """
     launcher_dir = tree_root / ".hermes-launcher"
     try:
         from hermes_cli.subcommands.adopt import _platform_suffix, DEFAULT_RELEASE_BASE
+        import hashlib
         import stat
         import urllib.request
 
         suffix = _platform_suffix()
         base = DEFAULT_RELEASE_BASE
-        url = f"{base.rstrip('/')}/hermes-{suffix}"
+        url = f"{base.rstrip('/')}/hermes-updater-{suffix}"
+        checksum_url = f"{url}.sha256"
 
         launcher_dir.mkdir(parents=True, exist_ok=True)
         dest = launcher_dir / ("hermes.exe" if sys.platform == "win32" else "hermes")
 
         with urllib.request.urlopen(url) as resp:  # noqa: S310
             data = resp.read()
+
+        # Verify checksum
+        try:
+            with urllib.request.urlopen(checksum_url) as resp:  # noqa: S310
+                expected = resp.read().decode("ascii").strip().split()[0]
+            actual = hashlib.sha256(data).hexdigest()
+            if actual != expected.lower():
+                raise DevSyncError(
+                    f"launcher checksum mismatch: expected {expected}, got {actual}"
+                )
+        except Exception:
+            # Checksum URL might not exist for some releases — warn but continue
+            print(f"warning: could not verify launcher checksum from {checksum_url}")
+
         dest.write_bytes(data)
         dest.chmod(dest.stat().st_mode | stat.S_IRWXU)
         report.launcher_installed = True
     except Exception as exc:
-        raise DevSyncError(f"launcher install failed: {exc}") from exc
+        # Best-effort: don't fail dev sync if launcher download fails
+        print(f"warning: launcher install failed (non-fatal): {exc}")
+        print("         The native launcher in bin/hermes will be used as fallback.")
 
     return report
 

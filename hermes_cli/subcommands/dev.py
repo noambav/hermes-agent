@@ -158,11 +158,18 @@ def _cmd_dev_gc(args, tree_root: Path) -> None:
     try:
         import os
 
-        # Check the PATH 'hermes' symlink
-        hermes_home = _get_hermes_home()
-        current_symlink = hermes_home / "current"
-        if current_symlink.is_symlink():
-            active_target = current_symlink.resolve()
+        # Check the PATH 'hermes' symlink — this is the real activation
+        # mechanism for dev/ejected trees (not hermes_home/current).
+        path_hermes = Path(os.environ.get("HERMES_HOME", "")) / "bin" / "hermes"
+        if not path_hermes.exists():
+            # Fallback: check common PATH locations
+            for candidate in [Path.home() / ".local" / "bin" / "hermes",
+                              Path("/usr/local/bin/hermes")]:
+                if candidate.is_symlink():
+                    path_hermes = candidate
+                    break
+        if path_hermes.is_symlink():
+            active_target = path_hermes.resolve()
     except Exception:
         pass
 
