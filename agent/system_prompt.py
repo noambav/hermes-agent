@@ -64,6 +64,25 @@ def _ra():
     return run_agent
 
 
+def resolve_context_files_cwd(platform: Optional[str]) -> Optional[str]:
+    """Working directory for context-file discovery, surface-aware.
+
+    A configured cwd (session contextvar / TERMINAL_CWD) always wins. When
+    none is configured, the interactive CLI promotes its launch dir to an
+    explicit choice — the user ran ``hermes`` from that directory on purpose
+    (install tree included; devs working ON hermes-agent want its AGENTS.md).
+    Daemon surfaces (gateway, tui/desktop backend, cron) return None so
+    ``build_context_files_prompt``'s install-tree fallback guard applies:
+    their process cwd is an accident of spawning, not a user choice (#64590).
+    """
+    cwd = resolve_context_cwd()
+    if cwd is not None:
+        return str(cwd)
+    if (platform or "cli") == "cli":
+        return os.getcwd()
+    return None
+
+
 def _resolve_platform_hint(agent: Any, platform_key: str, default_hint: str) -> str:
     """Apply a per-platform prompt-hint override to the default hint.
 
@@ -459,12 +478,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         context_parts.append(system_message)
 
     if not agent.skip_context_files:
-        # Prefer the configured TERMINAL_CWD (gateway mode). When unset (local
-        # CLI), None lets build_context_files_prompt fall back to the launch
-        # dir — the user's real cwd there, but the install dir for the gateway
-        # daemon, which is why the gateway sets TERMINAL_CWD.
+        # Surface-aware cwd for context-file discovery — see
+        # resolve_context_files_cwd() for the full contract (#64590).
         context_files_prompt = _r.build_context_files_prompt(
-            cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
+            cwd=resolve_context_files_cwd(agent.platform),
+            skip_soul=_soul_loaded,
             context_length=_ctx_len)
         if context_files_prompt:
             context_parts.append(context_files_prompt)

@@ -23,19 +23,25 @@ _UNSET: Any = object()
 _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
 
 # The Python package/source root (this file lives at <root>/agent/runtime_cwd.py).
-# When a backend is launched from, or self-spawns into, this tree (the desktop
-# app default), an os.getcwd() fallback would inject this repo's contributor
-# AGENTS.md as authoritative project context. Context discovery must never
-# resolve here.
+# Backends whose process cwd is an accident of spawning (the desktop's headless
+# `hermes serve`) use this to avoid DEFAULTING sessions into the Hermes source
+# tree, whose contributor AGENTS.md would otherwise load as project context
+# (#64590). An explicitly chosen path — session cwd, TERMINAL_CWD, terminal.cwd,
+# the launch dir of an interactive surface — is always honored, install tree
+# included: a developer working ON hermes-agent wants that AGENTS.md.
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _is_install_tree(p: Path) -> bool:
-    # True only when p IS the package root or sits inside it. Ancestors of the
-    # package root (a user home that happens to contain the checkout, a --user
-    # site-packages parent) are legitimate workspaces and must not be blocked.
+def is_install_tree(p: Path) -> bool:
+    """True when *p* IS the Hermes package/source root or sits inside it.
+
+    Ancestors of the package root (a user home that happens to contain the
+    checkout, a --user site-packages parent) are legitimate workspaces and
+    return False. Used only to steer *fallback* defaults away from the source
+    tree — never to reject a path the user or config explicitly picked.
+    """
     try:
-        p = p.resolve()
+        p = Path(p).resolve()
     except Exception:
         return False
     return p == _PACKAGE_ROOT or _PACKAGE_ROOT in p.parents
@@ -75,27 +81,28 @@ def resolve_agent_cwd() -> Path:
 
 def resolve_context_cwd() -> Path | None:
     # None means "no configured cwd": build_context_files_prompt then falls back
-    # to the launch dir (os.getcwd()), correct for a local CLI launched inside a
-    # real project. A configured path is validated here (previously it was passed
-    # through unchecked, diverging from resolve_agent_cwd), and the Hermes install
-    # tree is never returned, since its AGENTS.md would take over the system prompt.
+    # to the launch dir (os.getcwd()) — correct for the local CLI, where the
+    # launch dir IS the user's choice. Backend surfaces whose process cwd is
+    # accidental avoid slurping the install dir at the *default* layer instead:
+    # the gateway sets TERMINAL_CWD (see system_prompt.py), the TUI/desktop
+    # gateway resolves each session's cwd up front (see tui_gateway/server.py
+    # _fallback_spawn_cwd), and cron sets TERMINAL_CWD per workdir job.
+    #
+    # Explicitly configured paths are honored AS-IS — including a Hermes source
+    # checkout (a developer working on hermes-agent wants its AGENTS.md loaded).
+    # A configured-but-missing dir is returned too (discovery simply finds
+    # nothing there); it only warns, so a typo'd terminal.cwd is visible in the
+    # logs instead of silently steering discovery somewhere else (#64590).
     override = _session_cwd_override()
     if override:
         p = Path(override).expanduser()
         if not p.is_dir():
             logger.warning("configured working directory does not exist: %s", override)
-        elif _is_install_tree(p):
-            logger.warning("not loading context files from the Hermes install tree: %s", p)
-        else:
-            return p
-        return None
+        return p
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
         p = Path(raw).expanduser()
         if not p.is_dir():
             logger.warning("TERMINAL_CWD does not exist: %s", raw)
-        elif _is_install_tree(p):
-            logger.warning("not loading context files from the Hermes install tree: %s", p)
-        else:
-            return p
+        return p
     return None

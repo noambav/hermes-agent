@@ -708,17 +708,41 @@ class TestBuildContextFilesPrompt:
         assert "Ruff for linting" in result
         assert "Project Context" in result
 
-    def test_skips_agents_md_in_install_tree(self, monkeypatch, tmp_path):
-        # A backend launched from, or self-spawning into, the install tree must not
-        # load that tree's contributor AGENTS.md as project context. The guard keys
-        # off the package root, so point it at a fake tree holding an AGENTS.md.
+    def test_skips_agents_md_in_install_tree_fallback_only(self, monkeypatch, tmp_path):
+        # A backend with NO configured cwd falls back to os.getcwd(); when that
+        # accident lands in the install tree, its contributor AGENTS.md must not
+        # load. The guard keys off the package root, so point it at a fake tree.
+        import agent.runtime_cwd as rt
+
+        monkeypatch.setattr(rt, "_PACKAGE_ROOT", tmp_path.resolve())
+        (tmp_path / "AGENTS.md").write_text("Never give up on the right solution.")
+        monkeypatch.chdir(tmp_path)
+        result = build_context_files_prompt(cwd=None, skip_soul=True)
+        assert "Never give up" not in result
+        assert result == ""
+
+    def test_explicit_install_tree_cwd_still_loads_agents_md(self, monkeypatch, tmp_path):
+        # A developer deliberately working ON the Hermes checkout (explicit
+        # session cwd / TERMINAL_CWD / launch dir passed by the caller) must
+        # keep its AGENTS.md — the guard applies ONLY to the cwd=None fallback.
         import agent.runtime_cwd as rt
 
         monkeypatch.setattr(rt, "_PACKAGE_ROOT", tmp_path.resolve())
         (tmp_path / "AGENTS.md").write_text("Never give up on the right solution.")
         result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
-        assert "Never give up" not in result
-        assert result == ""
+        assert "Never give up" in result
+
+    def test_explicit_worktree_under_install_tree_loads_agents_md(self, monkeypatch, tmp_path):
+        # Dev worktrees live at <root>/.worktrees/<name> — inside the package
+        # root, but explicitly chosen. They keep their project context too.
+        import agent.runtime_cwd as rt
+
+        monkeypatch.setattr(rt, "_PACKAGE_ROOT", tmp_path.resolve())
+        wt = tmp_path / ".worktrees" / "wt-1"
+        wt.mkdir(parents=True)
+        (wt / "AGENTS.md").write_text("Worktree context loads.")
+        result = build_context_files_prompt(cwd=str(wt), skip_soul=True)
+        assert "Worktree context loads." in result
 
     def test_loads_cursorrules(self, tmp_path):
         (tmp_path / ".cursorrules").write_text("Always use type hints.")

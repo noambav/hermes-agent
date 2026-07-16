@@ -1976,22 +1976,27 @@ def build_context_files_prompt(
     When *skip_soul* is True, SOUL.md is not included here (it was already
     loaded via ``load_soul_md()`` for the identity slot).
     """
+    # Only the *fallback* is guarded against the Hermes install/source tree:
+    # when no cwd was configured anywhere, os.getcwd() is an accident of how
+    # the process was spawned, and a backend launched from (or self-spawned
+    # into) the install tree would load this repo's contributor AGENTS.md as
+    # authoritative project context for unrelated sessions (#64590). An
+    # EXPLICIT cwd — session cwd, TERMINAL_CWD, terminal.cwd, an interactive
+    # CLI's launch dir passed by the caller — is honored as-is, install tree
+    # included: a developer working ON hermes-agent wants that AGENTS.md.
+    from agent.runtime_cwd import is_install_tree
+
+    explicit_cwd = cwd is not None
     if cwd is None:
         cwd = os.getcwd()
 
     cwd_path = Path(cwd).resolve()
     sections = []
 
-    # Never discover project context inside the Hermes install/source tree. A
-    # backend launched from, or self-spawning into, that tree (the desktop app
-    # default) would otherwise load this repo's contributor AGENTS.md as
-    # authoritative project context. resolve_context_cwd() already guards the
-    # configured-path cases; this covers the cwd=None -> os.getcwd() fallback.
-    from agent.runtime_cwd import _is_install_tree
-
-    if _is_install_tree(cwd_path):
+    if not explicit_cwd and is_install_tree(cwd_path):
         logger.info(
-            "skipping project-context discovery in the Hermes install tree: %s",
+            "no configured cwd; skipping project-context discovery in the "
+            "Hermes install tree fallback: %s",
             cwd_path,
         )
         project_context = ""
