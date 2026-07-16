@@ -46,15 +46,29 @@ def _captured_context_cwd(agent):
 
 
 class TestContextFileCwd:
-    def test_none_when_terminal_cwd_unset(self, monkeypatch):
-        # Unset → None, so discovery falls back to the launch dir inside
-        # build_context_files_prompt (the local-CLI #19242 contract).
+    def test_cli_launch_dir_when_terminal_cwd_unset(self, monkeypatch, tmp_path):
+        # Unset → the interactive CLI (empty/None platform defaults to it)
+        # promotes its launch dir to an explicit choice, so discovery loads
+        # context files from it even inside the Hermes checkout (#64590).
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
-        assert _captured_context_cwd(_make_agent()) is None
+        monkeypatch.chdir(tmp_path)
+        assert _captured_context_cwd(_make_agent()) == str(tmp_path)
+
+    def test_daemon_none_when_terminal_cwd_unset(self, monkeypatch, tmp_path):
+        # Daemon surfaces pass None so build_context_files_prompt's
+        # install-tree fallback guard applies — their process cwd is an
+        # accident of spawning, not a user choice (#64590).
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.chdir(tmp_path)
+        assert _captured_context_cwd(_make_agent(platform="tui")) is None
 
     def test_configured_dir_when_terminal_cwd_set(self, monkeypatch, tmp_path):
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
-        assert _captured_context_cwd(_make_agent()) == tmp_path
+        assert _captured_context_cwd(_make_agent()) == str(tmp_path)
+
+    def test_configured_dir_wins_on_daemon_surface(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        assert _captured_context_cwd(_make_agent(platform="telegram")) == str(tmp_path)
 
 
 def _stable_prompt(agent):
