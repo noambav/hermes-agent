@@ -10,6 +10,7 @@ import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
+import { bindPaneRuntime, setPaneContent } from '@/store/pane-content'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
@@ -465,8 +466,11 @@ export function useSessionActions({
         updateSessionState(created.session_id, state => (runtimeInfo ? { ...state, ...runtimeInfo } : state), stored)
 
         openSessionTile(stored, dir)
+        const paneId = `session-tile:${stored}`
+        setPaneContent(paneId, { kind: 'chat', storedSessionId: stored })
+        bindPaneRuntime(paneId, created.session_id)
         patchSessionTile(stored, { runtimeId: created.session_id })
-        revealTreePane(`session-tile:${stored}`)
+        revealTreePane(paneId)
         broadcastSessionsChanged()
       } catch (error) {
         notifyError(error, copy.createSessionFailed)
