@@ -85,7 +85,6 @@ curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 
 | 安装方式                                | 代码位置                       | `hermes` 二进制                          | 数据目录                              |
 | --------------------------------------- | ------------------------------ | ---------------------------------------- | ------------------------------------- |
-| pip install                             | Python site-packages           | `~/.local/bin/hermes`（console_scripts） | `~/.hermes/`                          |
 | 用户级（git 安装程序）                  | `~/.hermes/hermes-agent/`      | `~/.local/bin/hermes`（符号链接）        | `~/.hermes/`                          |
 | Root 模式（`sudo curl … \| sudo bash`） | `/usr/local/lib/hermes-agent/` | `/usr/local/bin/hermes`                  | `/root/.hermes/`（或 `$HERMES_HOME`） |
 
@@ -123,8 +122,6 @@ hermes setup --portal
 ---
 
 ## 前置条件
-
-**pip install：** 除 Python 3.11+ 外无其他前置条件，其余均自动处理。
 
 **Git 安装程序：** 唯一的前置条件是 **Git**。安装程序自动处理其余一切：
 

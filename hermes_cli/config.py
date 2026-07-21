@@ -369,7 +369,10 @@ def is_managed() -> bool:
     return get_managed_system() is not None
 
 
-_NIX_UPDATE_MSG = "Update your Nix flake input and rebuild (e.g. nix flake update, nixos-rebuild, or home-manager switch)"
+_NIX_UPDATE_MSG = (
+    "Update Hermes through the Nix source that installed it "
+    "(e.g. nix profile upgrade, or update your flake input and rebuild with nixos-rebuild or home-manager switch)"
+)
 
 
 def get_managed_update_command() -> Optional[str]:
@@ -395,7 +398,7 @@ def _install_method_project_root(project_root: Optional[Path] = None) -> Path:
 
 
 def detect_install_method(project_root: Optional[Path] = None) -> str:
-    """Detect how Hermes was installed: 'docker', 'nixos', 'git', or 'unknown'.
+    """Detect how Hermes was installed: 'docker', 'nix', 'nixos', 'git', or 'unknown'.
 
     Resolution order:
     1. Code-scoped stamp ``<install tree>/.install_method`` (next to the
@@ -404,7 +407,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
        backward compatibility, but a ``docker`` value is IGNORED when we are
        not actually running inside a container (see below).
     3. HERMES_MANAGED env / .managed marker (NixOS managed mode)
-    4. /nix/store/ path detection -> 'nixos' (nix run / nix profile install)
+    4. /nix/store/ path detection -> 'nix' (nix run / nix profile install)
     5. .git directory presence -> 'git'
     6. Fallback -> 'unknown'
 
@@ -439,7 +442,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     See issue #34397.
     """
     root = _install_method_project_root(project_root)
-    supported_methods = {"docker", "nixos", "git", "unknown"}
+    supported_methods = {"docker", "nix", "nixos", "git", "unknown"}
 
     # 1. Code-scoped stamp — authoritative, immune to shared $HERMES_HOME.
     try:
@@ -476,7 +479,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     try:
         resolved = root.resolve()
         if resolved != _NIX_STORE and _NIX_STORE in resolved.parents:
-            return "nixos"
+            return "nix"
     except OSError:
         pass
 
@@ -529,7 +532,7 @@ def stamp_install_method(method: str, project_root: Optional[Path] = None) -> No
 
 def recommended_update_command_for_method(method: str) -> str:
     """Return the update command or guidance for a given install method."""
-    if method == "nixos":
+    if method in {"nix", "nixos"}:
         return _NIX_UPDATE_MSG
     if method == "docker":
         return "docker pull nousresearch/hermes-agent:latest"

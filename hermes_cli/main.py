@@ -9184,7 +9184,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     Installs that can't honor non-default branches (e.g. Docker) surface a
     one-line notice instead of silently dropping the flag.
     """
-    from hermes_cli.config import detect_install_method
+    from hermes_cli.config import detect_install_method, recommended_update_command_for_method
     method = detect_install_method(PROJECT_ROOT)
     if method == "docker":
         # Docker can't ``git fetch`` from within the container.  Surface the
@@ -9193,6 +9193,10 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         # ".git is missing" would point them at the wrong remediation.
         from hermes_cli.config import format_docker_update_message
         print(format_docker_update_message())
+        sys.exit(1)
+
+    if method in {"nix", "nixos"}:
+        print(recommended_update_command_for_method(method))
         sys.exit(1)
 
     git_dir = PROJECT_ROOT / ".git"
@@ -10180,6 +10184,7 @@ def cmd_update(args):
         format_docker_update_message,
         is_managed,
         managed_error,
+        recommended_update_command_for_method,
     )
 
     if is_managed():
@@ -10192,8 +10197,13 @@ def cmd_update(args):
     # below get a chance to error out with misleading "Not a git
     # repository" text.  See format_docker_update_message() for the full
     # rationale and tag-pinning / config-persistence notes.
-    if detect_install_method(PROJECT_ROOT) == "docker":
+    install_method = detect_install_method(PROJECT_ROOT)
+    if install_method == "docker":
         print(format_docker_update_message())
+        sys.exit(1)
+
+    if install_method in {"nix", "nixos"}:
+        print(recommended_update_command_for_method(install_method))
         sys.exit(1)
 
     if getattr(args, "check", False):
