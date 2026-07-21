@@ -8,10 +8,12 @@ import {
   $focusedPaneId,
   $focusedRuntimeId,
   $focusedStoredSessionId,
+  $paneContentById,
   $paneRuntimeById,
   $visibleSessionIds,
   bindPaneRuntime,
   clearPaneContent,
+  setFocusedPaneContent,
   setPaneContent,
 } from './pane-content'
 
@@ -84,5 +86,22 @@ describe('$visibleSessionIds', () => {
     bindPaneRuntime('session-tile:b', 'runtime-b')
 
     expect($focusedRuntimeId.get()).toBe('runtime-b')
+  })
+
+  it('changes content in the focused pane without touching another visible pane', () => {
+    setPaneContent('workspace', { kind: 'chat', storedSessionId: 'session-a' })
+    setPaneContent('session-tile:b', { kind: 'chat', storedSessionId: 'session-b' })
+    $layoutTree.set(split('row', [
+      group(['workspace'], { id: 'workspace-group' }),
+      group(['session-tile:b'], { id: 'tile-group' }),
+    ]))
+    $activeTreeGroup.set('tile-group')
+
+    setFocusedPaneContent({ kind: 'page', page: 'skills' })
+
+    expect($paneContentById.get()).toEqual({
+      workspace: { kind: 'chat', storedSessionId: 'session-a' },
+      'session-tile:b': { kind: 'page', page: 'skills' },
+    })
   })
 })

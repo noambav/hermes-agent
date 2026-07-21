@@ -64,6 +64,16 @@ export const $focusedPaneId = computed(
   }
 )
 
+export function setFocusedPaneContent(content: PaneContent) {
+  const paneId = $focusedPaneId.get()
+
+  if (!paneId) {
+    return
+  }
+
+  setPaneContent(paneId, content)
+}
+
 export const $focusedPaneContent = computed(
   [$focusedPaneId, $paneContentById],
   (paneId, contentById) => (paneId ? contentById[paneId] ?? null : null)
