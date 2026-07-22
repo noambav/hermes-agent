@@ -328,9 +328,25 @@ The user fork is the active publication target. Official upstream synchronizatio
 9. Do not use native automated Review while review and merge must remain human-only.
 10. Never expose credentials in cards, comments, logs, documentation, or chat.
 
-## Future work — not authorized yet
+## Required future work — not authorized yet
 
-### Phase 1: design the Instructor contract
+### Required capability: Planner Telegram clarification bridge
+
+This is a required part of the intended workflow, not an optional enhancement. It has not yet been implemented or proven. When Planner needs a meaningful human decision:
+
+1. Planner writes the complete question, context, and minimal numbered choices as a durable Kanban comment.
+2. Planner sends the same complete question through its configured Telegram gateway, including the board and task identity and a dashboard link when available.
+3. Planner blocks the Planning card with `kind="needs_input"` and ends the current run.
+4. A Telegram reply is explicitly correlated with that exact board and card; an ordinary reply must never be assumed to identify a task.
+5. The human answer is persisted to the Kanban thread before any unblock or resumed dispatch.
+6. Planner may evaluate the attached answer and self-unblock only its own Planning-clarification card when the answer is sufficient.
+7. A resumed Planner run begins with `kanban_show` and rereads the complete durable thread. If the answer is insufficient, Planner remains blocked and asks a follow-up.
+
+This bridge must never self-unblock an `[Implementation]` or `[Review]` card, authorize Instructor, approve implementation, or approve merge. Those transitions remain human-only.
+
+The bridge is required before the overall workflow is considered complete. Its implementation order relative to Instructor design remains a human sequencing decision; do not silently treat this document as implementation authorization.
+
+### Required Phase 1: design the Instructor contract
 
 This is the immediate next project, but it has not started. Before implementation, agree on a written contract covering:
 
@@ -348,7 +364,7 @@ This is the immediate next project, but it has not started. Before implementatio
 
 Do not implement Instructor while designing this contract. Proceed slowly, one decision at a time, and obtain explicit human approval before implementation.
 
-### Phase 2: implement and prove Instructor on a disposable card
+### Required Phase 2: implement and prove Instructor on a disposable card
 
 Only after Phase 1 approval:
 
@@ -361,7 +377,7 @@ Only after Phase 1 approval:
 7. Confirm no automatic merge and no premature Done transition.
 8. Archive/clean up the disposable proof after evidence is captured.
 
-### Phase 3: deterministic CI monitoring
+### Required Phase 3: deterministic CI monitoring
 
 After Instructor proof:
 
@@ -371,7 +387,7 @@ After Instructor proof:
 - Do not automatically resume Claude after failed CI.
 - Keep implementation credentials separate from any read-only monitor identity where practical.
 
-### Phase 4: human review, merge, and completion reconciliation
+### Required Phase 4: human review, merge, and completion reconciliation
 
 Design a human-only final gate:
 
@@ -385,7 +401,6 @@ Design a human-only final gate:
 These are explicitly deferred:
 
 - Optional separate LLM/code-review worker.
-- Telegram clarification notification and safe Planner self-resumption.
 - Broader updater or profile-selection hardening.
 - Official upstream synchronization.
 - Non-urgent cleanup of old restart scripts and diagnostics.
@@ -414,7 +429,17 @@ Triage → official Planning → committed planning artifacts
 → same-card blocked Implementation
 ```
 
-The next boundary to design is:
+Two required work items remain at the next boundary. The human chooses their implementation order:
+
+```text
+Planner Telegram clarification bridge
+  → durable Kanban question
+  → Telegram notification/reply correlation
+  → durable Kanban answer
+  → safe Planning-only resumption
+```
+
+and:
 
 ```text
 human implementation approval
