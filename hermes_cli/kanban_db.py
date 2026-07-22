@@ -1020,6 +1020,15 @@ class Task:
 
 
 @dataclass(frozen=True)
+class PlanningPreparationResult:
+    """Result of opting one existing card into the human-gated planning phase."""
+
+    task_id: str
+    status: str
+    idempotent: bool = False
+
+
+@dataclass(frozen=True)
 class PhaseHandoffResult:
     """Result of a constrained same-card workflow phase transition."""
 
@@ -3837,6 +3846,16 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _requires_done_only_parent_gate(
+    workflow_template_id: Optional[str], current_step_key: Optional[str]
+) -> bool:
+    """Human-gated Planning waits for a parent to reach Done, not Archived."""
+    return (
+        workflow_template_id == HUMAN_GATED_WORKFLOW_ID
+        and current_step_key == "planning"
+    )
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -3873,7 +3892,8 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, "
+            "workflow_template_id, current_step_key "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -3891,7 +3911,14 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            terminal_parent_statuses = (
+                ("done",)
+                if _requires_done_only_parent_gate(
+                    row["workflow_template_id"], row["current_step_key"]
+                )
+                else ("done", "archived")
+            )
+            if all(p["status"] in terminal_parent_statuses for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -3952,10 +3979,22 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        task_gate = conn.execute(
+            "SELECT workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        done_only = bool(task_gate) and _requires_done_only_parent_gate(
+            task_gate["workflow_template_id"], task_gate["current_step_key"]
+        )
+        parent_predicate = (
+            "p.status != 'done'"
+            if done_only
+            else "p.status NOT IN ('done', 'archived')"
+        )
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            f"WHERE l.child_id = ? AND {parent_predicate} LIMIT 1",
             (task_id,),
         ).fetchone()
         if undone:
@@ -4545,6 +4584,130 @@ def _title_for_human_gated_phase(title: str, phase: str) -> str:
     if not base:
         raise ValueError("phase handoff requires a non-empty feature title")
     return f"{prefix} {base}"
+
+
+def prepare_planning_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    expected_workspace_kind: str,
+    expected_workspace_path: Optional[str],
+) -> PlanningPreparationResult:
+    """Atomically opt one Triage card into the human-gated Planning phase.
+
+    The operation deliberately accepts no caller-selected workflow, phase,
+    assignee, title, or status.  It preserves the card's body, priority,
+    comments, dependencies, and workspace while installing the fixed Planning
+    identity.  Open parents keep the card in ``todo``; otherwise it is ready
+    for Planner dispatch.
+    """
+    actor = str(actor or "").strip()
+    if not actor:
+        raise ValueError("planning preparation actor is required")
+
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+        task = Task.from_row(row)
+
+        if (
+            task.workspace_kind != expected_workspace_kind
+            or task.workspace_path != expected_workspace_path
+        ):
+            raise ValueError("workspace changed during planning preparation")
+        if task.workspace_kind not in {"dir", "worktree"} or not task.workspace_path:
+            raise ValueError(
+                "planning preparation requires a persistent workspace "
+                "('dir' or 'worktree') with workspace_path"
+            )
+        if not os.path.isabs(task.workspace_path):
+            raise ValueError("planning preparation requires an absolute workspace_path")
+
+        undone_parent = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        target_status = "todo" if undone_parent else "ready"
+        planning_prefix = HUMAN_GATED_PHASE_PREFIXES["planning"]
+
+        # Lost-response retry: accept only the exact durable state produced by
+        # a prior successful call, and never emit a second event.
+        if task.workflow_template_id is not None or task.current_step_key is not None:
+            if (
+                task.workflow_template_id != HUMAN_GATED_WORKFLOW_ID
+                or task.current_step_key != "planning"
+                or task.assignee != HUMAN_GATED_PHASE_ASSIGNEES["planning"]
+                or task.status != target_status
+                or not task.title.startswith(f"{planning_prefix} ")
+            ):
+                raise ValueError(
+                    f"idempotent planning state is invalid for task {task_id}"
+                )
+            return PlanningPreparationResult(
+                task_id=task_id,
+                status=target_status,
+                idempotent=True,
+            )
+
+        if task.status != "triage":
+            raise ValueError(
+                f"planning preparation requires status 'triage', got {task.status!r}"
+            )
+        if task.current_run_id is not None or task.claim_lock is not None:
+            raise ValueError("planning preparation refuses a claimed or running task")
+
+        phase_match = _HUMAN_GATED_PREFIX_RE.match(task.title or "")
+        if phase_match and phase_match.group(0).strip().casefold() != planning_prefix.casefold():
+            raise ValueError("planning preparation refuses a non-Planning phase prefix")
+        next_title = _title_for_human_gated_phase(task.title, "planning")
+
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET title = ?, assignee = ?, status = ?,
+                   workflow_template_id = ?, current_step_key = 'planning',
+                   block_kind = NULL, block_recurrences = 0,
+                   consecutive_failures = 0, last_failure_error = NULL
+             WHERE id = ? AND status = 'triage'
+               AND workflow_template_id IS NULL AND current_step_key IS NULL
+               AND current_run_id IS NULL AND claim_lock IS NULL
+            """,
+            (
+                next_title,
+                HUMAN_GATED_PHASE_ASSIGNEES["planning"],
+                target_status,
+                HUMAN_GATED_WORKFLOW_ID,
+                task_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(f"planning preparation lost ownership of {task_id}")
+
+        _append_event(
+            conn,
+            task_id,
+            "planning_prepared",
+            {
+                "actor": actor,
+                "workflow_template_id": HUMAN_GATED_WORKFLOW_ID,
+                "step": "planning",
+                "from_status": task.status,
+                "to_status": target_status,
+                "from_title": task.title,
+                "to_title": next_title,
+                "assignee": HUMAN_GATED_PHASE_ASSIGNEES["planning"],
+            },
+        )
+
+        return PlanningPreparationResult(
+            task_id=task_id,
+            status=target_status,
+            idempotent=False,
+        )
 
 
 def handoff_task(
@@ -5782,7 +5945,8 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, workflow_template_id, current_step_key "
+        "FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -5801,9 +5965,16 @@ def promote_task(
             "WHERE l.child_id = ?",
             (task_id,),
         ).fetchall()
+        terminal_parent_statuses = (
+            ("done",)
+            if _requires_done_only_parent_gate(
+                row["workflow_template_id"], row["current_step_key"]
+            )
+            else ("done", "archived")
+        )
         unsatisfied = [
             p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
+            if p["status"] not in terminal_parent_statuses
         ]
         if unsatisfied:
             return False, (

@@ -14,6 +14,179 @@ from hermes_cli import kanban_db as kb
 
 
 @pytest.fixture
+def planning_candidate(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "default@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Default Test"],
+        check=True,
+    )
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Prepare audit logging",
+            body="Preserve me",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            triage=True,
+        )
+    return {"task_id": task_id, "repo": repo}
+
+
+def test_prepare_planning_tool_validates_git_and_prepares_same_card(planning_candidate):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_prepare_planning({"task_id": planning_candidate["task_id"]})
+    data = json.loads(out)
+
+    assert data == {
+        "ok": True,
+        "task_id": planning_candidate["task_id"],
+        "phase": "planning",
+        "status": "ready",
+        "assignee": "planner",
+        "idempotent": False,
+    }
+    with kb.connect() as conn:
+        task = kb.get_task(conn, planning_candidate["task_id"])
+    assert task is not None
+    assert task.title == "[Planning] Prepare audit logging"
+    assert task.body == "Preserve me"
+    assert task.workflow_template_id == kb.HUMAN_GATED_WORKFLOW_ID
+    assert task.current_step_key == "planning"
+
+
+def test_prepare_planning_retry_uses_durable_result_after_work_starts(
+    planning_candidate,
+):
+    from tools import kanban_tools as kt
+
+    first = json.loads(
+        kt._handle_prepare_planning({"task_id": planning_candidate["task_id"]})
+    )
+    (planning_candidate["repo"] / "planner-notes.md").write_text(
+        "work has started\n", encoding="utf-8"
+    )
+    retry = json.loads(
+        kt._handle_prepare_planning({"task_id": planning_candidate["task_id"]})
+    )
+
+    assert first["ok"] is True
+    assert retry["ok"] is True
+    assert retry["idempotent"] is True
+
+
+def test_prepare_planning_rejects_non_default_profile_without_env_hint(
+    tmp_path, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "planner"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text("toolsets:\n  - kanban\n")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    out = json.loads(kt._handle_prepare_planning({"task_id": "t_fake"}))
+    assert "Default orchestrator" in out["error"]
+
+
+def test_prepare_planning_rejects_workspace_change_during_transition(
+    planning_candidate, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    original = kb.prepare_planning_task
+
+    def race_workspace(conn, task_id, **kwargs):
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            ("/definitely/not/a/git/repo", task_id),
+        )
+        conn.commit()
+        return original(conn, task_id, **kwargs)
+
+    monkeypatch.setattr(kb, "prepare_planning_task", race_workspace)
+    out = json.loads(
+        kt._handle_prepare_planning({"task_id": planning_candidate["task_id"]})
+    )
+
+    assert "workspace changed" in out["error"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, planning_candidate["task_id"])
+    assert task is not None
+    assert task.status == "triage"
+    assert task.workflow_template_id is None
+
+
+def test_prepare_planning_tool_refuses_task_worker_without_mutation(
+    planning_candidate, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", planning_candidate["task_id"])
+    out = json.loads(
+        kt._handle_prepare_planning({"task_id": planning_candidate["task_id"]})
+    )
+
+    assert "orchestrator-only" in out["error"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, planning_candidate["task_id"])
+    assert task is not None
+    assert task.status == "triage"
+    assert task.workflow_template_id is None
+
+
+def test_prepare_planning_tool_rejects_non_git_workspace_before_mutation(
+    planning_candidate
+):
+    from tools import kanban_tools as kt
+
+    subprocess.run(
+        ["rm", "-rf", str(planning_candidate["repo"] / ".git")],
+        check=True,
+    )
+    out = json.loads(
+        kt._handle_prepare_planning({"task_id": planning_candidate["task_id"]})
+    )
+
+    assert "Git" in out["error"] or "git" in out["error"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, planning_candidate["task_id"])
+    assert task is not None
+    assert task.status == "triage"
+    assert task.workflow_template_id is None
+
+
+@pytest.fixture
 def planning_worker(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()

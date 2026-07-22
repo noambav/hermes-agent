@@ -98,6 +98,15 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _check_default_kanban_orchestrator_mode() -> bool:
+    """Expose Planning preparation only to the authoritative Default profile."""
+    if not _check_kanban_orchestrator_mode():
+        return False
+    from hermes_cli.profiles import get_active_profile_name
+
+    return get_active_profile_name() == "default"
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -916,6 +925,88 @@ def _implementation_handoff_body(
         "planning commit and artifact hashes above. Instructor must block on "
         "any mismatch, unresolved dependency, or scope expansion."
     )
+
+
+def _handle_prepare_planning(args: dict, **kw) -> str:
+    """Validate a Triage card's Git workspace and opt it into Planning."""
+    guard = _require_orchestrator_tool("kanban_prepare_planning")
+    if guard:
+        return guard
+
+    from hermes_cli.profiles import get_active_profile_name
+
+    profile = get_active_profile_name()
+    if profile != "default":
+        return tool_error(
+            "kanban_prepare_planning is restricted to the Default orchestrator profile"
+        )
+
+    tid = str(args.get("task_id") or "").strip()
+    if not tid:
+        return tool_error("task_id is required")
+
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"task {tid} not found")
+
+            # A lost-response retry must return the durable database result even
+            # after Planner has begun editing the worktree.
+            if task.workflow_template_id is not None or task.current_step_key is not None:
+                result = kb.prepare_planning_task(
+                    conn,
+                    tid,
+                    actor=profile,
+                    expected_workspace_kind=task.workspace_kind,
+                    expected_workspace_path=task.workspace_path,
+                )
+            else:
+                if task.workspace_kind not in {"dir", "worktree"}:
+                    return tool_error(
+                        "kanban_prepare_planning requires persistent Git workspace_kind "
+                        "'dir' or 'worktree'"
+                    )
+                if not task.workspace_path:
+                    return tool_error(
+                        "kanban_prepare_planning requires a task workspace_path"
+                    )
+                repo = Path(task.workspace_path).expanduser().resolve(strict=True)
+                git_root = Path(
+                    _git(repo, "rev-parse", "--show-toplevel")
+                ).resolve(strict=True)
+                if git_root != repo:
+                    return tool_error(
+                        f"task workspace_path must be the Git worktree root: {git_root}"
+                    )
+                if _git(repo, "status", "--porcelain"):
+                    return tool_error(
+                        "kanban_prepare_planning requires a clean Git worktree"
+                    )
+
+                result = kb.prepare_planning_task(
+                    conn,
+                    tid,
+                    actor=profile,
+                    expected_workspace_kind=task.workspace_kind,
+                    expected_workspace_path=task.workspace_path,
+                )
+            return _ok(
+                task_id=tid,
+                phase="planning",
+                status=result.status,
+                assignee="planner",
+                idempotent=result.idempotent,
+            )
+        finally:
+            conn.close()
+    except (OSError, ValueError) as e:
+        return tool_error(f"kanban_prepare_planning: {e}")
+    except Exception as e:
+        logger.exception("kanban_prepare_planning failed")
+        return tool_error(f"kanban_prepare_planning: {e}")
 
 
 def _handle_handoff(args: dict, **kw) -> str:
@@ -2098,6 +2189,30 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+KANBAN_PREPARE_PLANNING_SCHEMA = {
+    "name": "kanban_prepare_planning",
+    "description": (
+        "Default-orchestrator-only. Atomically opt one existing Triage card into "
+        "the fixed human-gated Planning phase. Preserves the same card, body, "
+        "priority, comments, dependencies, and persistent Git workspace; applies "
+        "the [Planning] title, assigns Planner, and chooses Ready or Todo from "
+        "parent completion. Accepts no workflow, phase, assignee, title, body, or "
+        "status overrides."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Existing Triage card to prepare for Planner.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
+    },
+}
+
+
 KANBAN_HANDOFF_SCHEMA = {
     "name": "kanban_handoff",
     "description": (
@@ -2507,6 +2622,15 @@ registry.register(
     handler=_handle_list,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
+)
+
+registry.register(
+    name="kanban_prepare_planning",
+    toolset="kanban",
+    schema=KANBAN_PREPARE_PLANNING_SCHEMA,
+    handler=_handle_prepare_planning,
+    check_fn=_check_default_kanban_orchestrator_mode,
+    emoji="📝",
 )
 
 registry.register(

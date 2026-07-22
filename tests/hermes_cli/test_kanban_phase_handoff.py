@@ -45,6 +45,193 @@ def _claimed_planning_task(conn, *, title: str = "[Planning] Add audit logging")
     return parent, child, claimed.current_run_id
 
 
+def test_prepare_planning_reuses_card_and_preserves_durable_state(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="merged dependency", assignee="planner")
+        assert kb.complete_task(conn, parent, summary="merged") is True
+        task_id = kb.create_task(
+            conn,
+            title="Add audit logging",
+            body="Preserve this exact request",
+            priority=17,
+            workspace_kind="dir",
+            workspace_path="/tmp/project",
+            parents=[parent],
+            triage=True,
+            created_by="human",
+        )
+        comment_id = kb.add_comment(
+            conn, task_id, author="human", body="Keep the format stable"
+        )
+
+        result = kb.prepare_planning_task(
+            conn,
+            task_id,
+            actor="default",
+            expected_workspace_kind="dir",
+            expected_workspace_path="/tmp/project",
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert result.task_id == task_id
+        assert result.status == "ready"
+        assert result.idempotent is False
+        assert task is not None
+        assert task.id == task_id
+        assert task.title == "[Planning] Add audit logging"
+        assert task.body == "Preserve this exact request"
+        assert task.assignee == "planner"
+        assert task.status == "ready"
+        assert task.priority == 17
+        assert task.workspace_kind == "dir"
+        assert task.workspace_path == "/tmp/project"
+        assert task.workflow_template_id == WORKFLOW
+        assert task.current_step_key == "planning"
+        assert kb.parent_ids(conn, task_id) == [parent]
+        assert kb.list_comments(conn, task_id)[0].id == comment_id
+
+        events = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "planning_prepared"
+        ]
+        assert len(events) == 1
+        assert events[0].payload == {
+            "actor": "default",
+            "workflow_template_id": WORKFLOW,
+            "step": "planning",
+            "from_status": "triage",
+            "to_status": "ready",
+            "from_title": "Add audit logging",
+            "to_title": "[Planning] Add audit logging",
+            "assignee": "planner",
+        }
+
+        retry = kb.prepare_planning_task(
+            conn,
+            task_id,
+            actor="default",
+            expected_workspace_kind="dir",
+            expected_workspace_path="/tmp/project",
+        )
+        assert retry.idempotent is True
+        assert retry.status == "ready"
+        assert len(
+            [
+                event
+                for event in kb.list_events(conn, task_id)
+                if event.kind == "planning_prepared"
+            ]
+        ) == 1
+
+
+def test_prepare_planning_keeps_open_dependency_in_todo(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="open dependency", assignee="planner")
+        task_id = kb.create_task(
+            conn,
+            title="Dependent feature",
+            workspace_kind="worktree",
+            workspace_path="/tmp/project-worktree",
+            parents=[parent],
+            triage=True,
+        )
+
+        result = kb.prepare_planning_task(
+            conn,
+            task_id,
+            actor="default",
+            expected_workspace_kind="worktree",
+            expected_workspace_path="/tmp/project-worktree",
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert result.status == "todo"
+        assert task is not None
+        assert task.status == "todo"
+        assert task.assignee == "planner"
+        assert task.current_step_key == "planning"
+
+
+@pytest.mark.parametrize(
+    ("title", "workspace_kind", "workspace_path", "match"),
+    [
+        ("Feature", "scratch", None, "persistent workspace"),
+        ("[Implementation] Feature", "dir", "/tmp/project", "phase prefix"),
+    ],
+)
+def test_prepare_planning_rejects_invalid_source_without_mutation(
+    kanban_home, title, workspace_kind, workspace_path, match
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title=title,
+            body="unchanged",
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            triage=True,
+        )
+        before = kb.get_task(conn, task_id)
+
+        with pytest.raises(ValueError, match=match):
+            kb.prepare_planning_task(
+                conn,
+                task_id,
+                actor="default",
+                expected_workspace_kind=workspace_kind,
+                expected_workspace_path=workspace_path,
+            )
+
+        after = kb.get_task(conn, task_id)
+        assert before is not None and after is not None
+        assert after.title == before.title
+        assert after.body == before.body
+        assert after.status == "triage"
+        assert after.assignee == before.assignee
+        assert after.workflow_template_id is None
+        assert after.current_step_key is None
+        assert not [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "planning_prepared"
+        ]
+
+
+def test_planning_card_requires_archived_parent_to_reach_done(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="archived dependency", assignee="planner")
+        assert kb.archive_task(conn, parent) is True
+        task_id = kb.create_task(
+            conn,
+            title="Dependent feature",
+            workspace_kind="dir",
+            workspace_path="/tmp/project",
+            parents=[parent],
+            triage=True,
+        )
+        result = kb.prepare_planning_task(
+            conn,
+            task_id,
+            actor="default",
+            expected_workspace_kind="dir",
+            expected_workspace_path="/tmp/project",
+        )
+        assert result.status == "todo"
+
+        assert kb.recompute_ready(conn) == 0
+        promoted, reason = kb.promote_task(
+            conn, task_id, actor="default", reason="should remain gated"
+        )
+        assert promoted is False
+        assert reason is not None and parent in reason
+
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        assert kb.claim_task(conn, task_id, claimer="planner:test") is None
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "todo"
+
+
 def test_planning_handoff_atomically_becomes_sticky_implementation_gate(kanban_home):
     with kb.connect() as conn:
         parent, task_id, run_id = _claimed_planning_task(conn)
