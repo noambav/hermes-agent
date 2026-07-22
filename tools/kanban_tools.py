@@ -28,9 +28,14 @@ through the board.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import mimetypes
 import os
+from pathlib import Path
+import subprocess
+import tempfile
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -753,6 +758,534 @@ def _handle_block(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_block failed")
         return tool_error(f"kanban_block: {e}")
+
+
+def _git(repo: Path, *args: str) -> str:
+    """Run a read-only Git query and return stripped stdout."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "git command failed").strip()
+        raise ValueError(detail)
+    return proc.stdout.strip()
+
+
+def _git_bytes(repo: Path, *args: str) -> bytes:
+    """Run a Git query and return exact stdout bytes without text decoding."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or b"git command failed").decode(
+            "utf-8", errors="replace"
+        ).strip()
+        raise ValueError(detail)
+    return bytes(proc.stdout)
+
+
+def _attachment_name_matches(actual: str, desired: str) -> bool:
+    """Match a native collision suffix (``name (N).md``) for one source name."""
+    if actual == desired:
+        return True
+    desired_path = Path(desired)
+    actual_path = Path(actual)
+    stem = actual_path.stem
+    return (
+        actual_path.suffix == desired_path.suffix
+        and stem.startswith(f"{desired_path.stem} (")
+        and stem.endswith(")")
+        and stem[len(desired_path.stem) + 2 : -1].isdigit()
+    )
+
+
+def _reusable_handoff_attachment(
+    kb,
+    conn,
+    task_id: str,
+    *,
+    filename: str,
+    data_sha256: str,
+    size: int,
+    excluded_ids: set[int],
+):
+    """Find an exact prior Planner blob left by an interrupted handoff."""
+    for attachment in kb.list_attachments(conn, task_id):
+        if (
+            attachment.id in excluded_ids
+            or attachment.uploaded_by != "planner-handoff"
+            or attachment.size != size
+            or not _attachment_name_matches(attachment.filename, filename)
+        ):
+            continue
+        try:
+            stored = Path(attachment.stored_path)
+            if stored.is_file() and hashlib.sha256(stored.read_bytes()).hexdigest() == data_sha256:
+                return attachment
+        except OSError:
+            continue
+    return None
+
+
+def _stage_handoff_blob(kb, task_id: str, data: bytes, *, board: Optional[str]) -> Path:
+    """Write a hidden temporary blob and remove it if staging fails."""
+    attachment_dir = kb.task_attachments_dir(task_id, board=board)
+    attachment_dir.mkdir(parents=True, exist_ok=True)
+    fd, staged_name = tempfile.mkstemp(
+        prefix=".handoff-", suffix=".tmp", dir=attachment_dir
+    )
+    os.close(fd)
+    staged_path = Path(staged_name)
+    try:
+        staged_path.write_bytes(data)
+    except Exception:
+        staged_path.unlink(missing_ok=True)
+        raise
+    return staged_path
+
+
+def _validated_repo_artifact(
+    repo: Path, raw_path: Any, *, label: str
+) -> tuple[str, Path]:
+    """Resolve a repository-relative regular file without following escapes."""
+    text = str(raw_path or "").strip()
+    if not text:
+        raise ValueError(f"{label} path is required")
+    rel = Path(text)
+    if rel.is_absolute():
+        raise ValueError(f"{label} path must be repository-relative")
+    candidate = repo / rel
+    if candidate.is_symlink():
+        raise ValueError(f"{label} path must not be a symlink")
+    try:
+        repo_resolved = repo.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(repo_resolved)
+    except (FileNotFoundError, ValueError):
+        raise ValueError(f"{label} path escapes the repository or does not exist")
+    if not resolved.is_file():
+        raise ValueError(f"{label} path must be a regular file")
+    return resolved.relative_to(repo_resolved).as_posix(), resolved
+
+
+def _normalized_repo_relative_arg(raw_path: Any) -> str:
+    """Lexically normalize a retry path without consulting the worktree."""
+    text = str(raw_path or "").strip()
+    if not text:
+        return text
+    path = Path(text)
+    if path.is_absolute():
+        return text
+    return Path(os.path.normpath(text)).as_posix()
+
+
+def _implementation_handoff_body(
+    *,
+    repo: Path,
+    branch: str,
+    base_commit: str,
+    planning_commit: str,
+    spec: dict,
+    plan: dict,
+    parent_ids: list[str],
+) -> str:
+    dependencies = ", ".join(parent_ids) if parent_ids else "none"
+    return (
+        "## Implementation handoff\n\n"
+        f"- Repository: `{repo}`\n"
+        f"- Worktree: `{repo}`\n"
+        f"- Branch: `{branch}`\n"
+        f"- Base commit: `{base_commit}`\n"
+        f"- Planning commit: `{planning_commit}`\n\n"
+        "### Artifacts\n"
+        f"- Specification: `{spec['path']}`\n"
+        f"  SHA-256: `{spec['sha256']}`\n"
+        f"  Attachment: `{spec['attachment_name']}` (ID `{spec['attachment_id']}`)\n"
+        f"- Plan: `{plan['path']}`\n"
+        f"  SHA-256: `{plan['sha256']}`\n"
+        f"  Attachment: `{plan['attachment_name']}` (ID `{plan['attachment_id']}`)\n\n"
+        "### Dependencies\n"
+        f"- Required completed cards: `{dependencies}`\n\n"
+        "### Approval\n"
+        "`Blocked → Ready` authorizes Instructor to implement exactly the "
+        "planning commit and artifact hashes above. Instructor must block on "
+        "any mismatch, unresolved dependency, or scope expansion."
+    )
+
+
+def _handle_handoff(args: dict, **kw) -> str:
+    """Verify Planner artifacts and atomically hand the same card to Instructor."""
+    if not os.environ.get("HERMES_KANBAN_TASK", "").strip():
+        return tool_error("kanban_handoff requires a dispatcher task-scoped worker")
+    if args.get("board") not in (None, ""):
+        return tool_error(
+            "task-scoped kanban_handoff must not include a board override"
+        )
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    if os.environ.get("HERMES_PROFILE", "").strip().lower() != "planner":
+        return tool_error(
+            "kanban_handoff planning -> implementation requires profile 'planner'"
+        )
+    if args.get("to_phase") != "implementation":
+        return tool_error(
+            "kanban_handoff currently supports only to_phase='implementation'"
+        )
+
+    planning_commit_arg = str(args.get("planning_commit") or "").strip().lower()
+    if not planning_commit_arg:
+        return tool_error("planning_commit is required")
+    board = None
+    staged_paths: list[Path] = []
+    finalized_paths: list[Path] = []
+    transaction_state = None
+    result = None
+    hook_notified = False
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"task {tid} not found")
+
+            # A lost-response retry must be decided from the durable handoff,
+            # not mutable live Git state. Find the closed Planner handoff run
+            # and require the caller's immutable artifact identifiers to match.
+            if task.current_step_key == "implementation":
+                handoff_runs = kb.list_runs(
+                    conn,
+                    tid,
+                    include_active=False,
+                    state_type="outcome",
+                    state_name="handed_off",
+                )
+                prior_run = handoff_runs[-1] if handoff_runs else None
+                prior_metadata = prior_run.metadata if prior_run else {}
+                requested_spec = _normalized_repo_relative_arg(
+                    args.get("specification")
+                )
+                requested_plan = _normalized_repo_relative_arg(args.get("plan"))
+                if (
+                    prior_metadata.get("planning_commit") != planning_commit_arg
+                    or prior_metadata.get("specification", {}).get("path")
+                    != requested_spec
+                    or prior_metadata.get("plan", {}).get("path")
+                    != requested_plan
+                ):
+                    return tool_error(
+                        "task is already in implementation with a different handoff"
+                    )
+                transition_key = prior_metadata.get("transition_key")
+                if not transition_key:
+                    raise RuntimeError(
+                        "idempotent handoff is missing prior transition metadata"
+                    )
+                result = kb.handoff_task(
+                    conn,
+                    tid,
+                    to_step="implementation",
+                    body=task.body,
+                    metadata=prior_metadata,
+                    transition_key=transition_key,
+                    expected_run_id=_worker_run_id(tid),
+                )
+                attachment_ids = [
+                    prior_metadata.get("specification", {}).get("attachment_id"),
+                    prior_metadata.get("plan", {}).get("attachment_id"),
+                ]
+                if any(value is None for value in attachment_ids):
+                    raise RuntimeError(
+                        "idempotent handoff is missing prior attachment metadata"
+                    )
+                return _ok(
+                    task_id=tid,
+                    phase=result.to_step,
+                    run_id=result.run_id,
+                    idempotent=True,
+                    planning_commit=planning_commit_arg,
+                    attachment_ids=attachment_ids,
+                )
+
+            if task.workspace_kind not in {"dir", "worktree"}:
+                return tool_error(
+                    "kanban_handoff requires persistent Git workspace_kind "
+                    "'dir' or 'worktree'"
+                )
+            if not task.workspace_path:
+                return tool_error("kanban_handoff requires a task workspace_path")
+            repo = Path(task.workspace_path).expanduser().resolve(strict=True)
+            git_root = Path(
+                _git(repo, "rev-parse", "--show-toplevel")
+            ).resolve(strict=True)
+            if git_root != repo:
+                return tool_error(
+                    f"task workspace_path must be the Git worktree root: {git_root}"
+                )
+            if _git(repo, "status", "--porcelain"):
+                return tool_error("kanban_handoff requires a clean worktree")
+
+            planning_commit = _git(
+                repo, "rev-parse", "--verify", f"{planning_commit_arg}^{{commit}}"
+            )
+            if planning_commit.lower() != planning_commit_arg:
+                return tool_error("planning_commit must be the full commit SHA")
+            head = _git(repo, "rev-parse", "HEAD")
+            if head != planning_commit:
+                return tool_error(
+                    f"planning_commit must equal worktree HEAD ({head})"
+                )
+            base_commit = _git(repo, "rev-parse", f"{planning_commit}^")
+            branch = _git(repo, "symbolic-ref", "--short", "HEAD")
+
+            spec_rel, spec_path = _validated_repo_artifact(
+                repo, args.get("specification"), label="specification"
+            )
+            plan_rel, plan_path = _validated_repo_artifact(
+                repo, args.get("plan"), label="plan"
+            )
+            if not spec_rel.startswith("docs/superpowers/specs/") or not spec_rel.endswith(
+                ".md"
+            ):
+                return tool_error(
+                    "specification must be under docs/superpowers/specs/ and be Markdown"
+                )
+            if not plan_rel.startswith("docs/superpowers/plans/") or not plan_rel.endswith(
+                ".md"
+            ):
+                return tool_error(
+                    "plan must be under docs/superpowers/plans/ and be Markdown"
+                )
+            if spec_rel == plan_rel:
+                return tool_error("specification and plan must be different files")
+            changed = {
+                line.strip()
+                for line in _git(
+                    repo,
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    planning_commit,
+                ).splitlines()
+                if line.strip()
+            }
+            expected_changed = {spec_rel, plan_rel}
+            if changed != expected_changed:
+                return tool_error(
+                    "planning commit must change exactly the specification and plan; "
+                    f"got {sorted(changed)}"
+                )
+            for label, rel in (("specification", spec_rel), ("plan", plan_rel)):
+                blob_size = int(
+                    _git(repo, "cat-file", "-s", f"{planning_commit}:{rel}")
+                )
+                if blob_size > kb.KANBAN_ATTACHMENT_MAX_BYTES:
+                    raise kb.AttachmentTooLarge(
+                        f"{label} exceeds the attachment size limit "
+                        f"({blob_size} > {kb.KANBAN_ATTACHMENT_MAX_BYTES} bytes)"
+                    )
+
+            spec_bytes = _git_bytes(
+                repo, "show", f"{planning_commit}:{spec_rel}"
+            )
+            plan_bytes = _git_bytes(repo, "show", f"{planning_commit}:{plan_rel}")
+            spec_hash = hashlib.sha256(spec_bytes).hexdigest()
+            plan_hash = hashlib.sha256(plan_bytes).hexdigest()
+            manifest = {
+                "planning_commit": planning_commit,
+                "specification": {"path": spec_rel, "sha256": spec_hash},
+                "plan": {"path": plan_rel, "sha256": plan_hash},
+            }
+            transition_key = hashlib.sha256(
+                json.dumps(
+                    manifest, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+
+            staged_spec = _stage_handoff_blob(kb, tid, spec_bytes, board=board)
+            staged_paths.append(staged_spec)
+            staged_plan = _stage_handoff_blob(kb, tid, plan_bytes, board=board)
+            staged_paths.append(staged_plan)
+            attachment_ids: list[int] = []
+
+            transaction_state = kb.WriteTxnState()
+            with kb.write_txn(conn, state=transaction_state):
+                locked_task = kb.get_task(conn, tid)
+                if locked_task is None:
+                    raise ValueError(f"task {tid} not found")
+                try:
+                    locked_repo = Path(locked_task.workspace_path or "").expanduser().resolve(
+                        strict=True
+                    )
+                except (OSError, ValueError):
+                    raise ValueError("task workspace changed during handoff")
+                if (
+                    locked_task.workspace_kind != task.workspace_kind
+                    or locked_repo != repo
+                ):
+                    raise ValueError("task workspace changed during handoff")
+
+                # Another identical caller may have committed while this call
+                # was staging blobs. BEGIN IMMEDIATE serializes this check with
+                # all attachment rows and the phase CAS below.
+                if locked_task.current_step_key == "implementation":
+                    handoff_runs = kb.list_runs(
+                        conn,
+                        tid,
+                        include_active=False,
+                        state_type="outcome",
+                        state_name="handed_off",
+                    )
+                    prior_run = handoff_runs[-1] if handoff_runs else None
+                    prior_metadata = prior_run.metadata if prior_run else {}
+                    result = kb.handoff_task(
+                        conn,
+                        tid,
+                        to_step="implementation",
+                        body=locked_task.body,
+                        metadata=prior_metadata,
+                        transition_key=transition_key,
+                        expected_run_id=_worker_run_id(tid),
+                        _within_transaction=True,
+                    )
+                    attachment_ids = [
+                        prior_metadata.get("specification", {}).get("attachment_id"),
+                        prior_metadata.get("plan", {}).get("attachment_id"),
+                    ]
+                    if any(value is None for value in attachment_ids):
+                        raise RuntimeError(
+                            "concurrent handoff winner is missing attachment metadata"
+                        )
+                else:
+                    used_attachment_ids: set[int] = set()
+                    artifact_inputs = (
+                        (
+                            "specification",
+                            Path(spec_rel).name,
+                            spec_bytes,
+                            spec_hash,
+                            staged_spec,
+                        ),
+                        (
+                            "plan",
+                            Path(plan_rel).name,
+                            plan_bytes,
+                            plan_hash,
+                            staged_plan,
+                        ),
+                    )
+                    artifact_metadata: dict[str, dict] = {}
+                    for kind, filename, data, data_hash, staged in artifact_inputs:
+                        attachment = _reusable_handoff_attachment(
+                            kb,
+                            conn,
+                            tid,
+                            filename=filename,
+                            data_sha256=data_hash,
+                            size=len(data),
+                            excluded_ids=used_attachment_ids,
+                        )
+                        if attachment is None:
+                            attachment_id, final_path = kb.add_staged_attachment_in_txn(
+                                conn,
+                                tid,
+                                filename=filename,
+                                staged_path=staged,
+                                content_type=(
+                                    mimetypes.guess_type(filename)[0]
+                                    or "text/markdown"
+                                ),
+                                size=len(data),
+                                uploaded_by="planner-handoff",
+                                board=board,
+                            )
+                            finalized_paths.append(final_path)
+                            attachment = kb.get_attachment(conn, attachment_id)
+                            if attachment is None:
+                                raise RuntimeError(
+                                    "failed to read back staged handoff attachment"
+                                )
+                        else:
+                            staged.unlink(missing_ok=True)
+                        used_attachment_ids.add(attachment.id)
+                        attachment_ids.append(attachment.id)
+                        artifact_metadata[kind] = {
+                            **manifest[kind],
+                            "attachment_id": attachment.id,
+                            "attachment_name": attachment.filename,
+                        }
+
+                    parent_ids = kb.parent_ids(conn, tid)
+                    body = _implementation_handoff_body(
+                        repo=repo,
+                        branch=branch,
+                        base_commit=base_commit,
+                        planning_commit=planning_commit,
+                        spec=artifact_metadata["specification"],
+                        plan=artifact_metadata["plan"],
+                        parent_ids=parent_ids,
+                    )
+                    metadata = {
+                        "repository": str(repo),
+                        "worktree": str(repo),
+                        "branch": branch,
+                        "base_commit": base_commit,
+                        "planning_commit": planning_commit,
+                        "specification": artifact_metadata["specification"],
+                        "plan": artifact_metadata["plan"],
+                        "parent_ids": parent_ids,
+                    }
+                    result = kb.handoff_task(
+                        conn,
+                        tid,
+                        to_step="implementation",
+                        body=redact_sensitive_text(body, force=True),
+                        metadata=metadata,
+                        transition_key=transition_key,
+                        expected_run_id=_worker_run_id(tid),
+                        _within_transaction=True,
+                    )
+
+            kb.notify_phase_handoff(result, board=board)
+            hook_notified = True
+            return _ok(
+                task_id=tid,
+                phase=result.to_step,
+                run_id=result.run_id,
+                idempotent=result.idempotent,
+                planning_commit=planning_commit,
+                attachment_ids=attachment_ids,
+            )
+        finally:
+            if (
+                transaction_state is not None
+                and transaction_state.committed
+                and result is not None
+                and not hook_notified
+            ):
+                kb.notify_phase_handoff(result, board=board)
+            for staged_path in staged_paths:
+                staged_path.unlink(missing_ok=True)
+            if not (transaction_state is not None and transaction_state.committed):
+                for final_path in finalized_paths:
+                    final_path.unlink(missing_ok=True)
+            conn.close()
+    except (OSError, ValueError, RuntimeError) as e:
+        return tool_error(f"kanban_handoff: {e}")
+    except Exception as e:
+        logger.exception("kanban_handoff failed")
+        return tool_error(f"kanban_handoff: {e}")
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
@@ -1565,6 +2098,43 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+KANBAN_HANDOFF_SCHEMA = {
+    "name": "kanban_handoff",
+    "description": (
+        "Atomically transform the current human-gated workflow card from "
+        "[Planning] to [Implementation]. Planner-only. Verifies a clean Git "
+        "worktree and a planning commit containing exactly the specification "
+        "and plan, computes hashes, attaches both files, generates the approval "
+        "record, assigns Instructor, and leaves the card sticky-Blocked for a human."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "to_phase": {
+                "type": "string",
+                "enum": ["implementation"],
+            },
+            "planning_commit": {
+                "type": "string",
+                "description": "Full SHA of the clean worktree HEAD planning-only commit.",
+            },
+            "specification": {
+                "type": "string",
+                "description": "Repository-relative specification Markdown path.",
+            },
+            "plan": {
+                "type": "string",
+                "description": "Repository-relative implementation-plan Markdown path.",
+            },
+        },
+        "required": ["to_phase", "planning_commit", "specification", "plan"],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -1955,6 +2525,15 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_handoff",
+    toolset="kanban",
+    schema=KANBAN_HANDOFF_SCHEMA,
+    handler=_handle_handoff,
+    check_fn=_check_kanban_mode,
+    emoji="🤝",
 )
 
 registry.register(
