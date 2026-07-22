@@ -124,6 +124,23 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# Constrained human-gated delivery workflow.  ``current_step_key`` is the
+# task's machine-readable phase; title prefixes are only the human-facing
+# rendering of that state.
+HUMAN_GATED_WORKFLOW_ID = "human-gated-development-v1"
+HUMAN_GATED_PHASE_PREFIXES = {
+    "planning": "[Planning]",
+    "implementation": "[Implementation]",
+}
+HUMAN_GATED_PHASE_ASSIGNEES = {
+    "planning": "planner",
+    "implementation": "instructor",
+}
+_HUMAN_GATED_PREFIX_RE = re.compile(
+    r"^\[(?:Planning|Implementation)\]\s*",
+    re.IGNORECASE,
+)
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -1000,6 +1017,17 @@ class Task:
                 else 0
             ),
         )
+
+
+@dataclass(frozen=True)
+class PhaseHandoffResult:
+    """Result of a constrained same-card workflow phase transition."""
+
+    task_id: str
+    from_step: str
+    to_step: str
+    run_id: Optional[int]
+    idempotent: bool = False
 
 
 @dataclass
@@ -2304,8 +2332,17 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
+@dataclass
+class WriteTxnState:
+    """Observable transaction boundary state for external resource cleanup."""
+
+    committed: bool = False
+
+
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection):
+def write_txn(
+    conn: sqlite3.Connection, *, state: Optional[WriteTxnState] = None
+):
     """Context manager for an IMMEDIATE write transaction.
 
     Use for any multi-statement write (creating a task + link, claiming a
@@ -2316,6 +2353,8 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
+    if state is None:
+        state = WriteTxnState()
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
@@ -2339,6 +2378,7 @@ def write_txn(conn: sqlite3.Connection):
             except sqlite3.OperationalError:
                 pass
             raise
+        state.committed = True
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
@@ -3074,6 +3114,96 @@ def store_attachment_bytes(
         raise
 
 
+def _add_attachment_in_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    filename: str,
+    stored_path: str,
+    content_type: Optional[str] = None,
+    size: int = 0,
+    uploaded_by: Optional[str] = None,
+) -> int:
+    """Insert attachment metadata/event inside the caller's write transaction."""
+    if not conn.in_transaction:
+        raise RuntimeError("attachment insertion requires an active transaction")
+    if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
+        raise ValueError(f"unknown task {task_id}")
+    now = int(time.time())
+    cur = conn.execute(
+        "INSERT INTO task_attachments "
+        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            filename.strip(),
+            stored_path,
+            content_type,
+            int(size),
+            uploaded_by,
+            now,
+        ),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "attached",
+        {"filename": filename.strip(), "size": int(size), "by": uploaded_by},
+    )
+    return int(cur.lastrowid or 0)
+
+
+def add_staged_attachment_in_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    filename: str,
+    staged_path: str | Path,
+    content_type: Optional[str] = None,
+    size: int = 0,
+    uploaded_by: Optional[str] = None,
+    board: Optional[str] = None,
+) -> tuple[int, Path]:
+    """Finalize a staged blob and insert its row in the caller's transaction.
+
+    The caller must remove ``final_path`` if its surrounding transaction rolls
+    back. A committed row always points at a fully-renamed blob because the
+    rename happens before the metadata INSERT.
+    """
+    if not conn.in_transaction:
+        raise RuntimeError("staged attachment finalization requires an active transaction")
+    staged = Path(staged_path)
+    if not staged.is_file():
+        raise ValueError("staged attachment file does not exist")
+    actual_size = staged.stat().st_size
+    if actual_size > KANBAN_ATTACHMENT_MAX_BYTES:
+        raise AttachmentTooLarge(
+            "attachment exceeds the size limit "
+            f"({actual_size} > {KANBAN_ATTACHMENT_MAX_BYTES} bytes)"
+        )
+    if int(size) != actual_size:
+        raise ValueError("staged attachment size changed")
+    safe_name = _safe_attachment_name(filename)
+    dest_dir = task_attachments_dir(task_id, board=board)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    final_path = _collision_free_path(dest_dir, safe_name)
+    staged.replace(final_path)
+    try:
+        attachment_id = _add_attachment_in_txn(
+            conn,
+            task_id,
+            filename=final_path.name,
+            stored_path=str(final_path.resolve()),
+            content_type=content_type,
+            size=size,
+            uploaded_by=uploaded_by,
+        )
+    except Exception:
+        final_path.unlink(missing_ok=True)
+        raise
+    return attachment_id, final_path
+
+
 def add_attachment(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3094,33 +3224,16 @@ def add_attachment(
         raise ValueError("attachment filename is required")
     if not stored_path or not stored_path.strip():
         raise ValueError("attachment stored_path is required")
-    now = int(time.time())
     with write_txn(conn):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone():
-            raise ValueError(f"unknown task {task_id}")
-        cur = conn.execute(
-            "INSERT INTO task_attachments "
-            "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                task_id,
-                filename.strip(),
-                stored_path,
-                content_type,
-                int(size),
-                uploaded_by,
-                now,
-            ),
-        )
-        _append_event(
+        return _add_attachment_in_txn(
             conn,
             task_id,
-            "attached",
-            {"filename": filename.strip(), "size": int(size), "by": uploaded_by},
+            filename=filename,
+            stored_path=stored_path,
+            content_type=content_type,
+            size=size,
+            uploaded_by=uploaded_by,
         )
-        return int(cur.lastrowid or 0)
 
 
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:
@@ -4089,6 +4202,232 @@ class HallucinatedCardsError(ValueError):
 
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
+
+
+def _title_for_human_gated_phase(title: str, phase: str) -> str:
+    """Replace a known phase prefix while preserving the feature title."""
+    prefix = HUMAN_GATED_PHASE_PREFIXES[phase]
+    base = _HUMAN_GATED_PREFIX_RE.sub("", title or "", count=1).strip()
+    if not base:
+        raise ValueError("phase handoff requires a non-empty feature title")
+    return f"{prefix} {base}"
+
+
+def handoff_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    to_step: str,
+    body: str,
+    metadata: dict,
+    transition_key: str,
+    expected_run_id: Optional[int],
+    _within_transaction: bool = False,
+) -> PhaseHandoffResult:
+    """Atomically hand a human-gated task to its next workflow phase.
+
+    This first constrained edge is ``planning -> implementation``.  It closes
+    the active Planner run as ``handed_off`` and leaves the same task sticky-
+    blocked for explicit human approval, assigned to Instructor.  Callers must
+    pre-validate any filesystem artifacts before entering this kernel method.
+
+    ``transition_key`` makes a retry after a lost tool response idempotent.
+    A retry only succeeds when the latest matching phase event carries the
+    exact same key; a different key is a conflicting second handoff.
+    """
+    if _within_transaction and not conn.in_transaction:
+        raise RuntimeError(
+            "internal phase handoff requires an active transaction"
+        )
+    if to_step != "implementation":
+        raise ValueError("only planning -> implementation handoff is supported")
+    if not isinstance(body, str) or not body.strip():
+        raise ValueError("phase handoff body is required")
+    if not isinstance(metadata, dict):
+        raise ValueError("phase handoff metadata must be a dict")
+    if not transition_key or not str(transition_key).strip():
+        raise ValueError("phase handoff transition_key is required")
+    if expected_run_id is None:
+        raise ValueError("planning handoff requires expected_run_id")
+
+    transition_key = str(transition_key).strip()
+    target_assignee = HUMAN_GATED_PHASE_ASSIGNEES[to_step]
+    run_id: Optional[int] = None
+
+    transaction_state = None if _within_transaction else WriteTxnState()
+    txn = (
+        contextlib.nullcontext()
+        if _within_transaction
+        else write_txn(conn, state=transaction_state)
+    )
+    result: Optional[PhaseHandoffResult] = None
+
+    def _notify_if_committed() -> None:
+        if transaction_state is not None and transaction_state.committed and result:
+            notify_phase_handoff(result)
+
+    with contextlib.ExitStack() as stack:
+        stack.callback(_notify_if_committed)
+        stack.enter_context(txn)
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+        task = Task.from_row(row)
+
+        # A worker can legitimately retry after the first call committed but
+        # its response was lost.  The task no longer has a current run then, so
+        # check the durable transition event before enforcing the run CAS.
+        if task.current_step_key == to_step:
+            if (
+                task.workflow_template_id != HUMAN_GATED_WORKFLOW_ID
+                or task.status != "blocked"
+                or task.assignee != target_assignee
+            ):
+                raise ValueError(
+                    f"idempotent handoff task state is invalid for {task_id}"
+                )
+            ev = conn.execute(
+                "SELECT payload, run_id FROM task_events "
+                "WHERE task_id = ? AND kind = 'phase_handoff' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            payload = json.loads(ev["payload"]) if ev and ev["payload"] else {}
+            if (
+                payload.get("workflow_template_id") != HUMAN_GATED_WORKFLOW_ID
+                or payload.get("from_step") != "planning"
+                or payload.get("to_step") != to_step
+            ):
+                raise ValueError(
+                    f"idempotent handoff event scope is invalid for {task_id}"
+                )
+            if payload.get("transition_key") == transition_key:
+                return PhaseHandoffResult(
+                    task_id=task_id,
+                    from_step=str(payload.get("from_step") or "planning"),
+                    to_step=to_step,
+                    run_id=int(ev["run_id"]) if ev and ev["run_id"] else None,
+                    idempotent=True,
+                )
+            raise ValueError(
+                f"task {task_id} is already in {to_step!r} with a different handoff"
+            )
+
+        if task.workflow_template_id != HUMAN_GATED_WORKFLOW_ID:
+            raise ValueError(
+                f"task {task_id} is not in workflow {HUMAN_GATED_WORKFLOW_ID!r}"
+            )
+        if task.current_step_key != "planning":
+            raise ValueError(
+                f"invalid phase transition {task.current_step_key!r} -> {to_step!r}"
+            )
+        if task.status != "running":
+            raise ValueError(f"task {task_id} must be running for phase handoff")
+        if task.assignee != "planner":
+            raise ValueError(f"planning handoff requires assignee 'planner', got {task.assignee!r}")
+        if task.current_run_id != int(expected_run_id):
+            raise ValueError(
+                f"stale phase handoff run for {task_id}: expected current run "
+                f"{expected_run_id}, got {task.current_run_id}"
+            )
+        source_prefix = HUMAN_GATED_PHASE_PREFIXES["planning"]
+        if not task.title.startswith(f"{source_prefix} "):
+            raise ValueError(
+                f"planning handoff requires exact {source_prefix} title prefix"
+            )
+
+        next_title = _title_for_human_gated_phase(task.title, to_step)
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET title = ?, body = ?, assignee = ?, status = 'blocked',
+                   current_step_key = ?, claim_lock = NULL,
+                   claim_expires = NULL, worker_pid = NULL,
+                   block_kind = NULL, block_recurrences = 0,
+                   consecutive_failures = 0, last_failure_error = NULL
+             WHERE id = ? AND status = 'running' AND current_run_id = ?
+            """,
+            (
+                next_title,
+                body.strip(),
+                target_assignee,
+                to_step,
+                task_id,
+                int(expected_run_id),
+            ),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(f"phase handoff lost ownership of {task_id}")
+
+        run_metadata = dict(metadata)
+        run_metadata.update(
+            {
+                "workflow_template_id": HUMAN_GATED_WORKFLOW_ID,
+                "from_step": "planning",
+                "to_step": to_step,
+                "transition_key": transition_key,
+            }
+        )
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="handed_off",
+            status="blocked",
+            summary="Planning artifacts ready; awaiting implementation approval.",
+            metadata=run_metadata,
+        )
+        event_payload = {
+            "workflow_template_id": HUMAN_GATED_WORKFLOW_ID,
+            "from_step": "planning",
+            "to_step": to_step,
+            "from_title": task.title,
+            "from_body": task.body,
+            "to_title": next_title,
+            "transition_key": transition_key,
+            "metadata": run_metadata,
+        }
+        _append_event(conn, task_id, "phase_handoff", event_payload, run_id=run_id)
+        # A regular blocked event makes this an explicit sticky gate understood
+        # by recompute_ready and existing notifier/dashboard consumers.
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {
+                "reason": "approval-required: implementation",
+                "kind": "phase_approval",
+                "phase": to_step,
+                "recurrences": 0,
+            },
+            run_id=run_id,
+        )
+
+        result = PhaseHandoffResult(
+            task_id=task_id,
+            from_step="planning",
+            to_step=to_step,
+            run_id=run_id,
+            idempotent=False,
+        )
+    if result is None:
+        raise RuntimeError("phase handoff completed without a result")
+    return result
+
+
+def notify_phase_handoff(
+    result: PhaseHandoffResult, *, board: Optional[str] = None
+) -> None:
+    """Fire the post-commit lifecycle hook for a successful phase handoff."""
+    if result.idempotent:
+        return
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_blocked",
+        result.task_id,
+        board=board or get_current_board(),
+        assignee=HUMAN_GATED_PHASE_ASSIGNEES[result.to_step],
+        run_id=result.run_id,
+        reason=f"approval-required: {result.to_step}",
+    )
 
 
 def complete_task(
