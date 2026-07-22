@@ -181,6 +181,16 @@ voice = [
   "sounddevice==0.5.5",
   "numpy==2.4.3",
 ]
+# "Hey Hermes" wake word — on-device hotword detection. Both engines are
+# optional; openWakeWord (ONNX) is the free default, Porcupine the premium
+# alternative. Lazy-installed on first /wake; mirrored in tools/lazy_deps.py.
+wake = [
+  "openwakeword==0.6.0",
+  "onnxruntime==1.27.0",
+  "pvporcupine==4.0.3",
+  "sounddevice==0.5.5",
+  "numpy==2.4.3",
+]
 pty = [
   # Kept as a no-op back-compat alias — `ptyprocess` and `pywinpty` are now
   # in the main `dependencies` list (with the same platform markers), so
@@ -342,6 +352,11 @@ locales = ["locales/*.yaml"]
 [tool.setuptools.package-data]
 hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]
 gateway = ["assets/**/*"]
+# Bundled "hey hermes" wake-word model (tools/wakewords/). It's a binary asset,
+# not a Python module, so wheels only carry it when declared here; without this
+# the wake word defaults to a missing model on packaged installs. MANIFEST.in
+# `recursive-include tools/wakewords` covers the sdist. See tools/wake_word.py.
+tools = ["wakewords/*.onnx", "wakewords/*.tflite", "wakewords/*.md"]
 plugins = [
   "*/dashboard/manifest.json",
   "*/dashboard/dist/*",

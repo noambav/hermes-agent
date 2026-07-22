@@ -117,6 +117,33 @@ def test_manifest_includes_bundled_skills():
     assert "graft optional-skills" in manifest
 
 
+def test_bundled_wakeword_model_ships_in_both_wheel_and_sdist():
+    """The default "hey hermes" wake word only works if the model ships.
+
+    ``tools/wakewords/hey_hermes.onnx`` is a binary asset (not a Python module),
+    so it reaches installed packages only when declared in both channels:
+    ``[tool.setuptools.package-data]`` (wheel) and ``MANIFEST.in`` (sdist, used
+    by downstream packagers). Without both, ``wake_word.openwakeword.model:
+    hey_hermes`` resolves to a missing file on packaged installs.
+    """
+    # The asset must exist for the globs to match.
+    on_disk = list((REPO_ROOT / "tools" / "wakewords").glob("*.onnx"))
+    assert on_disk, "expected a bundled wake-word model under tools/wakewords/"
+
+    # Wheel channel.
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    tools_pkg_data = data["tool"]["setuptools"]["package-data"].get("tools", [])
+    assert any(g.endswith(".onnx") for g in tools_pkg_data), (
+        "pyproject package-data 'tools' must ship wakewords/*.onnx (wheel)"
+    )
+
+    # Sdist channel.
+    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "recursive-include tools/wakewords" in manifest and ".onnx" in manifest, (
+        "MANIFEST.in must recursive-include tools/wakewords *.onnx (sdist)"
+    )
+
+
 def test_bundled_plugin_manifests_ship_in_both_wheel_and_sdist():
     """Regression test for #34034 / #28149.
 

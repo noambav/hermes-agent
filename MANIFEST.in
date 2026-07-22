@@ -10,5 +10,8 @@ graft locales
 recursive-include plugins plugin.yaml plugin.yml
 # Gateway assets include images plus YAML catalogs such as status_phrases.yaml.
 recursive-include gateway/assets *
+# Bundled "hey hermes" wake-word model. Binary assets, so ship them in the sdist
+# too (downstream packagers build from it); package-data covers the wheel.
+recursive-include tools/wakewords *.onnx *.tflite *.md
 global-exclude __pycache__
 global-exclude *.py[cod]
