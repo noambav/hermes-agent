@@ -2754,67 +2754,57 @@ def stream_tts_to_speaker(
     stop_event: threading.Event,
     tts_done_event: threading.Event,
     display_callback: Optional[Callable[[str], None]] = None,
+    provider: Optional[str] = None,
 ):
-    """Consume text deltas from *text_queue*, buffer them into sentences,
-    and stream each sentence through ElevenLabs TTS to the speaker in
-    real-time.
+    """Consume text deltas from *text_queue*, buffer them into sentences, and
+    speak each sentence the moment it's ready — the conversational path.
+
+    Provider-agnostic. A registered streaming provider (ElevenLabs, OpenAI, …)
+    plays chunked PCM through one sounddevice stream for the lowest latency;
+    every other provider (edge, the default) is spoken per-sentence via the sync
+    ``text_to_speech_tool`` path, so audio still starts on sentence one instead
+    of after the whole reply.
 
     Protocol:
         * The producer puts ``str`` deltas onto *text_queue*.
         * A ``None`` sentinel signals end-of-text (flush remaining buffer).
-        * *stop_event* can be set to abort early (e.g. user interrupt).
+        * *stop_event* can be set to abort early (barge-in / user interrupt).
         * *tts_done_event* is **set** in the ``finally`` block so callers
           waiting on it (continuous voice mode) know playback is finished.
     """
     tts_done_event.clear()
 
     try:
-        # --- TTS client setup (optional -- display_callback works without it) ---
-        client = None
         output_stream = None
-        voice_id = DEFAULT_ELEVENLABS_VOICE_ID
-        model_id = DEFAULT_ELEVENLABS_STREAMING_MODEL_ID
-
         tts_config = _load_tts_config()
-        el_config = tts_config.get("elevenlabs") or {}
-        voice_id = el_config.get("voice_id", voice_id)
-        model_id = el_config.get("streaming_model_id",
-                                 el_config.get("model_id", model_id))
-        # Per-sentence cap for the streaming path. Look up the cap against
-        # the *streaming* model_id (defaults to eleven_flash_v2_5 = 40k chars),
-        # not the sync model_id. A user override
-        # (tts.elevenlabs.max_text_length) still wins.
-        stream_max_len = _resolve_max_text_length(
-            "elevenlabs",
-            {**tts_config, "elevenlabs": {**el_config, "model_id": model_id}},
-        )
 
-        api_key = (get_env_value("ELEVENLABS_API_KEY") or "")
-        if not api_key:
-            logger.warning("ELEVENLABS_API_KEY not set; streaming TTS audio disabled")
-        else:
+        # Prefer a chunked streamer for low time-to-first-audio; fall back to
+        # per-sentence sync synthesis (universal — edge + every non-streamer).
+        from tools.tts_streaming import resolve_streaming_provider
+        streamer = resolve_streaming_provider(tts_config, preferred=provider)
+
+        stream_max_len = 0
+        if streamer is not None:
             try:
-                ElevenLabs = _import_elevenlabs()
-                client = ElevenLabs(api_key=api_key)
-            except ImportError:
-                logger.warning("elevenlabs package not installed; streaming TTS disabled")
-
-            # Open a single sounddevice output stream for the lifetime of
-            # this function.  ElevenLabs pcm_24000 produces signed 16-bit
-            # little-endian mono PCM at 24 kHz.
-            if client is not None:
-                try:
-                    sd = _import_sounddevice()
-                    output_stream = sd.OutputStream(
-                        samplerate=24000, channels=1, dtype="int16",
-                    )
-                    output_stream.start()
-                except (ImportError, OSError) as exc:
-                    logger.debug("sounddevice not available: %s", exc)
-                    output_stream = None
-                except Exception as exc:
-                    logger.warning("sounddevice OutputStream failed: %s", exc)
-                    output_stream = None
+                stream_max_len = _resolve_max_text_length(
+                    provider or _get_provider(tts_config), tts_config
+                )
+            except Exception:
+                stream_max_len = 0
+            try:
+                sd = _import_sounddevice()
+                output_stream = sd.OutputStream(
+                    samplerate=streamer.sample_rate,
+                    channels=streamer.channels,
+                    dtype="int16",
+                )
+                output_stream.start()
+            except (ImportError, OSError) as exc:
+                logger.debug("sounddevice not available, streamer→tempfile: %s", exc)
+                output_stream = None
+            except Exception as exc:
+                logger.warning("sounddevice OutputStream failed: %s", exc)
+                output_stream = None
 
         sentence_buf = ""
         min_sentence_len = 20
@@ -2840,33 +2830,51 @@ def stream_tts_to_speaker(
             # Display raw sentence on screen before TTS processing
             if display_callback is not None:
                 display_callback(sentence)
-            # Skip audio generation if no TTS client available
-            if client is None:
+            # No chunked streamer → per-sentence sync synthesis (universal).
+            if streamer is None:
+                _speak_via_sync(cleaned)
                 return
-            # Truncate very long sentences (ElevenLabs streaming path)
-            if len(cleaned) > stream_max_len:
+            # Truncate very long sentences to the provider's per-request cap.
+            if stream_max_len and len(cleaned) > stream_max_len:
                 cleaned = cleaned[:stream_max_len]
             try:
-                audio_iter = client.text_to_speech.convert(
-                    text=cleaned,
-                    voice_id=voice_id,
-                    model_id=model_id,
-                    output_format="pcm_24000",
-                )
+                audio_iter = streamer.stream(cleaned)
                 if output_stream is not None:
+                    import numpy as _np
                     for chunk in audio_iter:
                         if stop_event.is_set():
                             break
-                        import numpy as _np
-                        audio_array = _np.frombuffer(chunk, dtype=_np.int16)
-                        output_stream.write(audio_array.reshape(-1, 1))
+                        output_stream.write(_np.frombuffer(chunk, dtype=_np.int16).reshape(-1, 1))
                 else:
-                    # Fallback: write chunks to temp file and play via system player
-                    _play_via_tempfile(audio_iter, stop_event)
+                    # No audio device: buffer chunks to a temp WAV and play it.
+                    _play_via_tempfile(audio_iter, stop_event, streamer.sample_rate)
             except Exception as exc:
                 logger.warning("Streaming TTS sentence failed: %s", exc)
 
-        def _play_via_tempfile(audio_iter, stop_evt):
+        def _speak_via_sync(cleaned: str):
+            """Synthesize one sentence via the proven sync tool, then block on
+            playback. No chunked API, but per-*sentence* granularity keeps the
+            flow conversational for edge and every other non-streaming provider.
+            """
+            tmp_path = None
+            try:
+                fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+                os.close(fd)
+                text_to_speech_tool(text=cleaned, output_path=tmp_path)
+                if (not stop_event.is_set() and os.path.isfile(tmp_path)
+                        and os.path.getsize(tmp_path) > 0):
+                    from tools.voice_mode import play_audio_file
+                    play_audio_file(tmp_path)
+            except Exception as exc:
+                logger.warning("Sync per-sentence TTS failed: %s", exc)
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+        def _play_via_tempfile(audio_iter, stop_evt, sample_rate=24000):
             """Write PCM chunks to a temp WAV file and play it."""
             tmp_path = None
             try:
@@ -2876,7 +2884,7 @@ def stream_tts_to_speaker(
                 with wave.open(tmp, "wb") as wf:
                     wf.setnchannels(1)
                     wf.setsampwidth(2)  # 16-bit
-                    wf.setframerate(24000)
+                    wf.setframerate(sample_rate)
                     for chunk in audio_iter:
                         if stop_evt.is_set():
                             break

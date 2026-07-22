@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
+import { monitorSpeechDuringPlayback } from '@/lib/voice-barge-in'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
 import { notify, notifyError } from '@/store/notifications'
 
@@ -224,20 +225,37 @@ export function useVoiceConversation({
     async (text: string) => {
       setStatus('speaking')
 
+      // VAD barge-in: the user talking over the reply cuts playback AND drops
+      // the not-yet-spoken remainder, so the loop goes straight back to
+      // listening instead of finishing the interrupted answer.
+      let barged = false
+
+      const stopMonitor = monitorSpeechDuringPlayback(() => {
+        barged = true
+        stopVoicePlayback()
+      })
+
       try {
         await playSpeechText(text, { source: 'voice-conversation' })
       } catch (error) {
         notifyError(error, voiceCopy.playbackFailed)
       } finally {
+        stopMonitor()
+
+        if (barged) {
+          awaitingSpokenResponseRef.current = false
+          consumePendingResponse()
+          resetSpeechBuffer()
+        }
+
         if (enabledRef.current) {
           pendingStartRef.current = true
-          setStatus('idle')
-        } else {
-          setStatus('idle')
         }
+
+        setStatus('idle')
       }
     },
-    [voiceCopy.playbackFailed]
+    [consumePendingResponse, voiceCopy.playbackFailed]
   )
 
   const start = useCallback(async () => {

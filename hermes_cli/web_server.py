@@ -9,6 +9,7 @@ Usage:
     python -m hermes_cli.main web --port 8080
 """
 
+import contextlib
 from contextlib import asynccontextmanager, contextmanager
 
 import asyncio
@@ -4462,6 +4463,129 @@ async def speak_text(payload: TTSSpeakRequest):
         "mime_type": mime_type,
         "provider": result.get("provider"),
     }
+
+
+def _split_text_for_speak_stream(text: str, cap: int) -> list:
+    """Split *text* into provider-cap-sized pieces on sentence boundaries."""
+    from tools.tts_tool import _SENTENCE_BOUNDARY_RE
+
+    cap = cap if cap and cap > 0 else 4000
+    pieces, buf = [], ""
+    for sentence in filter(str.strip, _SENTENCE_BOUNDARY_RE.split(text)):
+        while len(sentence) > cap:
+            pieces.append(sentence[:cap])
+            sentence = sentence[cap:]
+        if buf and len(buf) + len(sentence) + 1 > cap:
+            pieces.append(buf)
+            buf = sentence
+        else:
+            buf = f"{buf} {sentence}" if buf else sentence
+    if buf:
+        pieces.append(buf)
+    return pieces
+
+
+@app.websocket("/api/audio/speak-stream")
+async def speak_stream_ws(ws: "WebSocket") -> None:
+    """Streaming TTS for the desktop: text in, raw int16 PCM frames out.
+
+    Speech starts as soon as the provider yields its first chunk instead of
+    after full synthesis + base64 round-trip (the POST /api/audio/speak path).
+
+    Protocol:
+      client → ``{"text": "..."}`` (one JSON text frame)
+      server → ``{"type": "start", "sample_rate": N, "channels": 1}``,
+               binary PCM frames, then ``{"type": "end"}``
+      server → ``{"type": "fallback"}`` when the configured provider has no
+               chunked API — the client re-requests via the POST endpoint.
+
+    Any inbound frame or a disconnect after start is barge-in: synthesis and
+    the stream are torn down immediately.
+    """
+    if not _ws_auth_ok(ws):
+        await ws.close(code=4401)
+        return
+    if not _ws_request_is_allowed(ws):
+        await ws.close(code=4403)
+        return
+    await ws.accept()
+
+    try:
+        text = str(json.loads(await ws.receive_text()).get("text") or "").strip()
+    except Exception:
+        text = ""
+    if not text:
+        with contextlib.suppress(Exception):
+            await ws.close(code=4400)
+        return
+
+    loop = asyncio.get_running_loop()
+
+    def _resolve():
+        from tools.tts_streaming import resolve_streaming_provider
+        from tools.tts_tool import _get_provider, _load_tts_config, _resolve_max_text_length
+
+        cfg = _load_tts_config()
+        streamer = resolve_streaming_provider(cfg)
+        cap = _resolve_max_text_length(_get_provider(cfg), cfg) if streamer else 0
+        return streamer, cap
+
+    try:
+        streamer, cap = await loop.run_in_executor(None, _resolve)
+    except Exception:
+        _log.exception("speak-stream provider resolution failed")
+        streamer, cap = None, 0
+    if streamer is None:
+        with contextlib.suppress(Exception):
+            await ws.send_json({"type": "fallback"})
+            await ws.close()
+        return
+
+    await ws.send_json(
+        {"type": "start", "sample_rate": streamer.sample_rate, "channels": streamer.channels}
+    )
+
+    stop = threading.Event()
+    chunks: asyncio.Queue = asyncio.Queue()
+
+    def _produce():
+        try:
+            for piece in _split_text_for_speak_stream(text, cap):
+                if stop.is_set():
+                    return
+                for chunk in streamer.stream(piece):
+                    if stop.is_set():
+                        return
+                    loop.call_soon_threadsafe(chunks.put_nowait, chunk)
+        except Exception as exc:
+            _log.warning("speak-stream synthesis failed: %s", exc)
+        finally:
+            loop.call_soon_threadsafe(chunks.put_nowait, None)
+
+    threading.Thread(target=_produce, daemon=True).start()
+
+    async def _watch_client():
+        # Any inbound frame (or disconnect) after start = barge-in.
+        with contextlib.suppress(Exception):
+            await ws.receive()
+        stop.set()
+
+    watcher = asyncio.ensure_future(_watch_client())
+    try:
+        while True:
+            chunk = await chunks.get()
+            if chunk is None:
+                break
+            await ws.send_bytes(chunk)
+        if not stop.is_set():
+            await ws.send_json({"type": "end"})
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        stop.set()
+        watcher.cancel()
+        with contextlib.suppress(Exception):
+            await ws.close()
 
 
 @app.get("/api/actions/{name}/status")

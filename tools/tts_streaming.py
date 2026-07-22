@@ -1,0 +1,150 @@
+"""Provider-agnostic streaming TTS: sentence text → int16 PCM chunk iterator.
+
+The keystone of Hermes' conversational voice UX. `stream_tts_to_speaker`
+(``tools.tts_tool``) owns the sentence buffer, sounddevice output, and
+stop/queue protocol; this module owns the *provider* half — turning one
+sentence into audio the moment it's ready, so playback starts on sentence one
+instead of after the whole reply.
+
+Two provider shapes, one contract (int16 mono PCM at ``sample_rate``):
+
+* **True streamers** (`StreamingTTSProvider.stream`) — chunked APIs
+  (ElevenLabs pcm_24000, OpenAI pcm, …) that yield audio as it synthesizes.
+  Lowest time-to-first-audio.
+* **Everyone else** — providers with no chunked API still get per-*sentence*
+  playback via the proven sync `text_to_speech_tool` path (handled by the
+  dispatcher, not here), so edge (the default) is conversational too.
+
+Adding a streamer is `@register("name")` on a `StreamingTTSProvider` subclass;
+the dispatcher, config gate (`tts.<name>.streaming`), and resolver come free.
+"""
+
+from __future__ import annotations
+
+import logging
+from abc import ABC, abstractmethod
+from typing import Callable, Dict, Iterator, Optional
+
+from tools.tts_tool import _get_provider, get_env_value
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# ABC + registry
+# ---------------------------------------------------------------------------
+
+class StreamingTTSProvider(ABC):
+    """Yields raw int16, little-endian, mono PCM chunks at ``sample_rate``."""
+
+    sample_rate: int = 24000
+    channels: int = 1
+    sample_width: int = 2  # bytes/sample (int16)
+
+    def __init__(self, tts_config: Dict, section: Dict):
+        self.tts_config = tts_config
+        self.section = section
+
+    @staticmethod
+    @abstractmethod
+    def available() -> bool:
+        """True when this provider's credentials/SDK are usable right now."""
+
+    @abstractmethod
+    def stream(self, text: str) -> Iterator[bytes]:
+        """Yield PCM chunks for ``text``. Raise on failure (caller logs)."""
+
+
+_REGISTRY: Dict[str, type[StreamingTTSProvider]] = {}
+
+
+def register(name: str) -> Callable[[type[StreamingTTSProvider]], type[StreamingTTSProvider]]:
+    def _wrap(cls: type[StreamingTTSProvider]) -> type[StreamingTTSProvider]:
+        _REGISTRY[name] = cls
+        return cls
+
+    return _wrap
+
+
+def resolve_streaming_provider(
+    tts_config: Dict,
+    preferred: Optional[str] = None,
+) -> Optional[StreamingTTSProvider]:
+    """Return a ready streamer for the *configured* provider, else ``None``.
+
+    ``None`` means "no chunked API for this provider" — the dispatcher then
+    speaks per-sentence via the sync path, preserving the user's chosen voice.
+    We never silently swap to a different provider just to get streaming.
+    """
+    name = (preferred or _get_provider(tts_config)).lower().strip()
+    cls = _REGISTRY.get(name)
+    if cls is None or not cls.available():
+        return None
+    try:
+        return cls(tts_config, tts_config.get(name) or {})
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("streaming provider %s init failed: %s", name, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------
+
+@register("elevenlabs")
+class ElevenLabsStreamer(StreamingTTSProvider):
+    """ElevenLabs chunked HTTP → pcm_24000 (the original reference path)."""
+
+    sample_rate = 24000
+
+    @staticmethod
+    def available() -> bool:
+        return bool(get_env_value("ELEVENLABS_API_KEY"))
+
+    def stream(self, text: str) -> Iterator[bytes]:
+        from tools.tts_tool import (
+            DEFAULT_ELEVENLABS_STREAMING_MODEL_ID,
+            DEFAULT_ELEVENLABS_VOICE_ID,
+            _import_elevenlabs,
+        )
+
+        client = _import_elevenlabs()(api_key=get_env_value("ELEVENLABS_API_KEY"))
+        voice_id = self.section.get("voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
+        model_id = self.section.get(
+            "streaming_model_id",
+            self.section.get("model_id", DEFAULT_ELEVENLABS_STREAMING_MODEL_ID),
+        )
+        yield from client.text_to_speech.convert(
+            text=text,
+            voice_id=voice_id,
+            model_id=model_id,
+            output_format="pcm_24000",
+        )
+
+
+@register("openai")
+class OpenAIStreamer(StreamingTTSProvider):
+    """OpenAI speech with ``response_format=pcm`` (24 kHz mono int16)."""
+
+    sample_rate = 24000
+
+    @staticmethod
+    def available() -> bool:
+        return bool(get_env_value("OPENAI_API_KEY"))
+
+    def stream(self, text: str) -> Iterator[bytes]:
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=get_env_value("OPENAI_API_KEY"),
+            base_url=get_env_value("OPENAI_BASE_URL") or None,
+        )
+        model = self.section.get("model", "gpt-4o-mini-tts")
+        voice = self.section.get("voice", "alloy")
+        with client.audio.speech.with_streaming_response.create(
+            model=model,
+            voice=voice,
+            input=text,
+            response_format="pcm",
+        ) as response:
+            yield from response.iter_bytes()
