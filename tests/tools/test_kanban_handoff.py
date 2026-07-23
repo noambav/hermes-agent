@@ -846,3 +846,301 @@ def test_handoff_reads_artifacts_from_declared_commit_not_mutable_worktree(
     assert run.metadata["specification"]["sha256"] == hashlib.sha256(
         committed_bytes
     ).hexdigest()
+
+
+@pytest.fixture
+def implementation_worker(planning_worker, monkeypatch, tmp_path):
+    """A claimed Instructor run with a real Planning authorization and fake gh."""
+    from tools import kanban_tools as kt
+
+    planning = json.loads(kt._handle_handoff(_handoff_args(planning_worker)))
+    assert planning["ok"] is True
+
+    repo = planning_worker["repo"]
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/NousResearch/hermes-agent.git",
+        ],
+        check=True,
+    )
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET branch_name = 'main' WHERE id = ?",
+            (planning_worker["task_id"],),
+        )
+        assert kb.unblock_task(conn, planning_worker["task_id"]) is True
+        claimed = kb.claim_task(
+            conn, planning_worker["task_id"], claimer="instructor:test"
+        )
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+
+    (repo / "audit.py").write_text("AUDIT_ENABLED = True\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "audit.py"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "feat: add audit logging"],
+        check=True,
+        capture_output=True,
+    )
+    implementation_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "open(os.environ['GH_ARGV_LOG'], 'w').write('\\n'.join(sys.argv[1:]))\n"
+        "if os.environ.get('GH_FAKE_ERROR'):\n"
+        "    print(os.environ['GH_FAKE_ERROR'], file=sys.stderr)\n"
+        "    raise SystemExit(1)\n"
+        "print(os.environ['GH_FAKE_OUTPUT'])\n",
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{__import__('os').environ['PATH']}")
+    monkeypatch.setenv("GH_ARGV_LOG", str(tmp_path / "gh-argv"))
+    monkeypatch.setenv("HERMES_PROFILE", "instructor")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    pr = {
+        "number": 42,
+        "url": "https://github.com/NousResearch/hermes-agent/pull/42",
+        "state": "OPEN",
+        "isDraft": False,
+        "headRefName": "main",
+        "headRefOid": implementation_head,
+        "baseRefName": "main",
+        "headRepository": {"nameWithOwner": "NousResearch/hermes-agent"},
+    }
+    monkeypatch.setenv("GH_FAKE_OUTPUT", json.dumps(pr))
+    return {
+        **planning_worker,
+        "implementation_head": implementation_head,
+        "run_id": run_id,
+        "pr": pr,
+        "gh_argv_log": tmp_path / "gh-argv",
+    }
+
+
+def _review_args(worker, **overrides):
+    args = {
+        "to_phase": "review",
+        "pull_request": worker["pr"]["url"],
+        "implementation_head": worker["implementation_head"],
+        "base_branch": "main",
+        "verification_commands": [
+            {"command": "python -m pytest tests/tools/test_kanban_handoff.py -q", "exit_code": 0},
+            {"command": "ruff check tools/kanban_tools.py", "exit_code": 0},
+        ],
+    }
+    args.update(overrides)
+    return args
+
+
+def test_review_handoff_verifies_boundary_and_builds_compact_handoff(
+    implementation_worker,
+):
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_handoff(_review_args(implementation_worker)))
+
+    assert result == {
+        "ok": True,
+        "task_id": implementation_worker["task_id"],
+        "phase": "review",
+        "run_id": implementation_worker["run_id"],
+        "idempotent": False,
+        "pull_request": implementation_worker["pr"]["url"],
+    }
+    assert implementation_worker["gh_argv_log"].read_text().splitlines()[:3] == [
+        "pr",
+        "view",
+        implementation_worker["pr"]["url"],
+    ]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, implementation_worker["task_id"])
+        run = kb.latest_run(conn, implementation_worker["task_id"])
+        events = kb.list_events(conn, implementation_worker["task_id"])
+    assert task is not None and task.current_step_key == "review"
+    assert task.status == "blocked" and task.assignee is None
+    assert "Repository:" in task.body
+    assert f"Worktree: `{implementation_worker['repo']}`" in task.body
+    assert "Branch: `main`" in task.body
+    assert "Base branch: `main`" in task.body
+    assert f"Planning commit: `{implementation_worker['planning_commit']}`" in task.body
+    assert f"Implementation head: `{implementation_worker['implementation_head']}`" in task.body
+    assert "PR: `#42`" in task.body
+    assert "Changed files: `1`" in task.body and "audit.py" in task.body
+    assert "exit `0`" in task.body
+    assert "Human review and merge required; Instructor cannot complete this card." in task.body
+    assert run is not None
+    assert run.metadata["planning_commit"] == implementation_worker["planning_commit"]
+    assert run.metadata["implementation_head"] == implementation_worker["implementation_head"]
+    assert run.metadata["pull_request"] == {
+        "number": 42,
+        "url": implementation_worker["pr"]["url"],
+    }
+    persisted = json.dumps({"metadata": run.metadata, "events": [e.payload for e in events]})
+    assert "raw_output" not in persisted and "token" not in persisted
+
+
+@pytest.mark.parametrize(
+    ("missing", "message"),
+    [
+        ("pull_request", "pull_request is required"),
+        ("implementation_head", "implementation_head is required"),
+        ("base_branch", "base_branch is required"),
+        ("verification_commands", "verification_commands are required"),
+    ],
+)
+def test_review_handoff_requires_inputs_and_instructor_profile(
+    implementation_worker, monkeypatch, missing, message
+):
+    from tools import kanban_tools as kt
+
+    args = _review_args(implementation_worker)
+    args.pop(missing)
+    assert message in kt._handle_handoff(args)
+
+    monkeypatch.setenv("HERMES_PROFILE", "planner")
+    assert "requires profile 'instructor'" in kt._handle_handoff(
+        _review_args(implementation_worker)
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("dirty", "clean worktree"),
+        ("head", "must equal worktree HEAD"),
+        ("base", "base branch"),
+        ("attachment", "attachment hash"),
+        ("artifact_changed", "planning artifact changed"),
+    ],
+)
+def test_review_handoff_rejects_git_or_planning_authorization_mismatch(
+    implementation_worker, monkeypatch, mutation, message
+):
+    from tools import kanban_tools as kt
+
+    args = _review_args(implementation_worker)
+    repo = implementation_worker["repo"]
+    if mutation == "dirty":
+        (repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+    elif mutation == "head":
+        args["implementation_head"] = "f" * 40
+    elif mutation == "base":
+        args["base_branch"] = "release"
+    elif mutation == "attachment":
+        with kb.connect() as conn:
+            planning_run = kb.list_runs(
+                conn,
+                implementation_worker["task_id"],
+                include_active=False,
+                state_type="outcome",
+                state_name="handed_off",
+            )[0]
+            attachment = kb.get_attachment(
+                conn, planning_run.metadata["specification"]["attachment_id"]
+            )
+        assert attachment is not None
+        Path(attachment.stored_path).write_text("tampered\n", encoding="utf-8")
+    else:
+        spec = repo / implementation_worker["spec_rel"]
+        spec.write_text("changed after planning\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", implementation_worker["spec_rel"]], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "change planning artifact"],
+            check=True,
+            capture_output=True,
+        )
+        head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        args["implementation_head"] = head
+        pr = dict(implementation_worker["pr"], headRefOid=head)
+        monkeypatch.setenv("GH_FAKE_OUTPUT", json.dumps(pr))
+
+    assert message in kt._handle_handoff(args)
+
+
+@pytest.mark.parametrize(
+    ("pr_update", "message"),
+    [
+        ({"state": "CLOSED"}, "open pull request"),
+        ({"isDraft": True}, "draft"),
+        ({"headRefName": "other"}, "head branch"),
+        ({"headRefOid": "e" * 40}, "head SHA"),
+        ({"baseRefName": "release"}, "base branch"),
+        ({"headRepository": {"nameWithOwner": "fork/hermes-agent"}}, "repository"),
+    ],
+)
+def test_review_handoff_rejects_conflicting_pull_request(
+    implementation_worker, monkeypatch, pr_update, message
+):
+    from tools import kanban_tools as kt
+
+    pr = {**implementation_worker["pr"], **pr_update}
+    monkeypatch.setenv("GH_FAKE_OUTPUT", json.dumps(pr))
+    assert message in kt._handle_handoff(_review_args(implementation_worker))
+
+
+def test_review_handoff_rejects_missing_or_ambiguous_pr_and_redacts_error(
+    implementation_worker, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("GH_FAKE_OUTPUT", json.dumps([implementation_worker["pr"]] * 2))
+    assert "exactly one pull request" in kt._handle_handoff(
+        _review_args(implementation_worker)
+    )
+
+    token = "ghp_" + "FAKEGITHUBTOKEN12345678901234"
+    monkeypatch.setenv("GH_FAKE_ERROR", f"gh auth token {token}")
+    out = kt._handle_handoff(_review_args(implementation_worker))
+    assert token not in out
+    assert "gh pr view failed" in out
+
+
+def test_review_handoff_retry_is_idempotent_and_conflict_fails(
+    implementation_worker, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    args = _review_args(implementation_worker)
+    first = json.loads(kt._handle_handoff(args))
+    monkeypatch.setenv("GH_FAKE_ERROR", "retry must not call gh")
+    second = json.loads(kt._handle_handoff(args))
+    assert first["idempotent"] is False
+    assert second["idempotent"] is True
+
+    conflict = _review_args(implementation_worker, base_branch="release")
+    assert "different review handoff" in kt._handle_handoff(conflict)
+
+
+def test_review_handoff_schema_exposes_conditional_review_inputs():
+    from tools import kanban_tools as kt
+
+    schema = kt.KANBAN_HANDOFF_SCHEMA["parameters"]
+    assert schema["properties"]["to_phase"]["enum"] == ["implementation", "review"]
+    assert set(schema["properties"]) >= {
+        "pull_request",
+        "implementation_head",
+        "base_branch",
+        "verification_commands",
+    }
+    assert schema["required"] == ["to_phase"]

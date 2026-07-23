@@ -1009,7 +1009,7 @@ def _handle_prepare_planning(args: dict, **kw) -> str:
         return tool_error(f"kanban_prepare_planning: {e}")
 
 
-def _handle_handoff(args: dict, **kw) -> str:
+def _handle_implementation_handoff(args: dict, **kw) -> str:
     """Verify Planner artifacts and atomically hand the same card to Instructor."""
     if not os.environ.get("HERMES_KANBAN_TASK", "").strip():
         return tool_error("kanban_handoff requires a dispatcher task-scoped worker")
@@ -1377,6 +1377,427 @@ def _handle_handoff(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_handoff failed")
         return tool_error(f"kanban_handoff: {e}")
+
+
+def _validate_review_worker(args: dict) -> tuple[str, str, str, list[dict], str]:
+    """Validate and canonicalize Instructor-supplied Review evidence."""
+    if os.environ.get("HERMES_PROFILE", "").strip().lower() != "instructor":
+        raise ValueError("kanban_handoff implementation -> review requires profile 'instructor'")
+
+    pull_request = str(args.get("pull_request") or "").strip()
+    if not pull_request:
+        raise ValueError("pull_request is required (GitHub PR URL or number)")
+    implementation_head = str(args.get("implementation_head") or "").strip().lower()
+    if not implementation_head:
+        raise ValueError("implementation_head is required")
+    if len(implementation_head) != 40 or any(
+        char not in "0123456789abcdef" for char in implementation_head
+    ):
+        raise ValueError("implementation_head must be a full lowercase commit SHA")
+    base_branch = str(args.get("base_branch") or "").strip()
+    if not base_branch:
+        raise ValueError("base_branch is required")
+
+    commands = args.get("verification_commands")
+    if not isinstance(commands, list) or not commands:
+        raise ValueError("verification_commands are required")
+    canonical_commands = []
+    for result in commands:
+        command = result.get("command") if isinstance(result, dict) else None
+        exit_code = result.get("exit_code") if isinstance(result, dict) else None
+        if (
+            not isinstance(command, str)
+            or not command.strip()
+            or command.strip().splitlines() != [command.strip()]
+            or isinstance(exit_code, bool)
+            or not isinstance(exit_code, int)
+        ):
+            raise ValueError(
+                "verification_commands must contain command and integer exit_code results"
+            )
+        if exit_code != 0:
+            raise ValueError("verification_commands must all have exit_code 0")
+        canonical_commands.append({"command": command.strip(), "exit_code": 0})
+    verification_digest = hashlib.sha256(
+        json.dumps(
+            canonical_commands, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    return (
+        pull_request,
+        implementation_head,
+        base_branch,
+        canonical_commands,
+        verification_digest,
+    )
+
+
+def _load_planning_authorization(kb, conn, task_id: str, repo: Path) -> dict:
+    """Recover and verify the immutable Planning handoff artifacts."""
+    runs = kb.list_runs(
+        conn,
+        task_id,
+        include_active=False,
+        state_type="outcome",
+        state_name="handed_off",
+    )
+    planning_run = next(
+        (
+            run
+            for run in reversed(runs)
+            if (run.metadata or {}).get("from_step") == "planning"
+        ),
+        None,
+    )
+    authorization = planning_run.metadata if planning_run else None
+    if not isinstance(authorization, dict):
+        raise ValueError("prior Planning handoff metadata is required")
+    planning_commit = str(authorization.get("planning_commit") or "")
+    if not planning_commit:
+        raise ValueError("prior Planning handoff is missing planning_commit")
+
+    for location in ("repository", "worktree"):
+        try:
+            authorized_repo = Path(authorization[location]).expanduser().resolve(strict=True)
+        except (KeyError, OSError, TypeError, ValueError):
+            raise ValueError(f"prior Planning handoff has invalid {location}")
+        if authorized_repo != repo:
+            raise ValueError(f"task workspace differs from Planning {location}")
+
+    for label in ("specification", "plan"):
+        artifact = authorization.get(label)
+        if not isinstance(artifact, dict):
+            raise ValueError(f"prior Planning handoff is missing {label} metadata")
+        rel = str(artifact.get("path") or "")
+        expected_hash = str(artifact.get("sha256") or "")
+        attachment = kb.get_attachment(conn, artifact.get("attachment_id"))
+        if attachment is None:
+            raise ValueError(f"Planning {label} attachment is missing")
+        blob = _git_bytes(repo, "show", f"{planning_commit}:{rel}")
+        if hashlib.sha256(blob).hexdigest() != expected_hash:
+            raise ValueError(f"Planning {label} Git blob hash does not match authorization")
+        try:
+            attachment_hash = hashlib.sha256(
+                Path(attachment.stored_path).read_bytes()
+            ).hexdigest()
+        except OSError as exc:
+            raise ValueError(f"Planning {label} attachment cannot be read: {exc}")
+        if attachment_hash != expected_hash:
+            raise ValueError(f"Planning {label} attachment hash does not match authorization")
+    return authorization
+
+
+def _github_repository(remote_url: str) -> str:
+    """Return owner/repository for a credential-free GitHub remote."""
+    from urllib.parse import urlparse
+
+    remote_url = remote_url.strip()
+    if remote_url.startswith("git@github.com:"):
+        path = remote_url.removeprefix("git@github.com:")
+    else:
+        parsed = urlparse(remote_url)
+        if parsed.hostname != "github.com" or parsed.username not in (None, "git"):
+            raise ValueError("origin remote must be a credential-free GitHub URL")
+        if parsed.password or (parsed.username and parsed.scheme in {"http", "https"}):
+            raise ValueError("origin remote URL must not contain credentials")
+        path = parsed.path.lstrip("/")
+    repository = path.removesuffix(".git").strip("/")
+    if repository.count("/") != 1 or not all(repository.split("/")):
+        raise ValueError("origin remote must identify one GitHub repository")
+    return repository
+
+
+def _verify_review_git_state(
+    kb,
+    conn,
+    task,
+    *,
+    implementation_head: str,
+) -> dict:
+    """Verify workspace identity, Git state, and Planning ancestry."""
+    if task.workspace_kind not in {"dir", "worktree"} or not task.workspace_path:
+        raise ValueError("kanban_handoff requires a persistent Git worktree")
+    repo = Path(task.workspace_path).expanduser().resolve(strict=True)
+    git_root = Path(_git(repo, "rev-parse", "--show-toplevel")).resolve(strict=True)
+    if git_root != repo:
+        raise ValueError(f"task workspace_path must be the Git worktree root: {git_root}")
+    if _git(repo, "status", "--porcelain"):
+        raise ValueError("kanban_handoff review requires a clean worktree")
+    branch = _git(repo, "symbolic-ref", "--short", "HEAD")
+    if branch != task.branch_name:
+        raise ValueError("current branch does not match the task branch")
+    head = _git(repo, "rev-parse", "HEAD")
+    if head != implementation_head:
+        raise ValueError(f"implementation_head must equal worktree HEAD ({head})")
+
+    authorization = _load_planning_authorization(kb, conn, task.id, repo)
+    planning_commit = authorization["planning_commit"]
+    try:
+        _git(repo, "merge-base", "--is-ancestor", planning_commit, implementation_head)
+    except ValueError:
+        raise ValueError("planning commit must be an ancestor of implementation_head")
+    if int(_git(repo, "rev-list", "--count", f"{planning_commit}..{implementation_head}")) < 1:
+        raise ValueError("implementation range must be non-empty")
+    artifact_paths = [
+        authorization["specification"]["path"],
+        authorization["plan"]["path"],
+    ]
+    changed_artifacts = _git(
+        repo,
+        "diff",
+        "--name-only",
+        f"{planning_commit}..{implementation_head}",
+        "--",
+        *artifact_paths,
+    )
+    if changed_artifacts:
+        raise ValueError("a planning artifact changed after the planning commit")
+
+    changed_files = [
+        line
+        for line in _git(
+            repo, "diff", "--name-only", f"{planning_commit}..{implementation_head}"
+        ).splitlines()
+        if line
+    ]
+    diff_stat = _git(
+        repo, "diff", "--shortstat", f"{planning_commit}..{implementation_head}"
+    )
+    repository = _github_repository(_git(repo, "config", "--get", "remote.origin.url"))
+    return {
+        "repo": repo,
+        "repository": repository,
+        "branch": branch,
+        "planning": authorization,
+        "changed_files": changed_files,
+        "diff_stat": diff_stat,
+    }
+
+
+def _verify_open_pull_request(
+    repo: Path,
+    pull_request: str,
+    *,
+    repository: str,
+    branch: str,
+    implementation_head: str,
+    base_branch: str,
+) -> dict:
+    """Resolve one PR with gh and prove its complete local identity."""
+    fields = (
+        "number,url,state,isDraft,headRefName,headRefOid,baseRefName,"
+        "headRepository,headRepositoryOwner"
+    )
+    proc = subprocess.run(
+        ["gh", "pr", "view", pull_request, "--json", fields],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = redact_sensitive_text(
+            (proc.stderr or proc.stdout or "no pull request found").strip(), force=True
+        )
+        raise ValueError(f"gh pr view failed: {detail}")
+    try:
+        pr = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise ValueError("gh pr view returned invalid JSON")
+    if not isinstance(pr, dict):
+        raise ValueError("gh pr view must resolve exactly one pull request")
+    if pr.get("state") != "OPEN":
+        raise ValueError("pull request must be one open pull request")
+    if pr.get("isDraft") is not False:
+        raise ValueError("pull request must not be a draft")
+
+    number = pr.get("number")
+    url = str(pr.get("url") or "")
+    expected_url = f"https://github.com/{repository}/pull/{number}"
+    if not isinstance(number, int) or number < 1 or url != expected_url:
+        raise ValueError("pull request URL/number does not match the repository")
+    if pull_request.isdigit():
+        if int(pull_request) != number:
+            raise ValueError("pull request number does not match gh")
+    elif pull_request != url:
+        raise ValueError("pull request URL does not match gh")
+
+    head_repository = pr.get("headRepository")
+    head_name = (
+        head_repository.get("nameWithOwner")
+        if isinstance(head_repository, dict)
+        else None
+    )
+    if head_name != repository:
+        raise ValueError("pull request head repository is ambiguous or does not match")
+    if pr.get("headRefName") != branch:
+        raise ValueError("pull request head branch does not match the task")
+    if pr.get("headRefOid") != implementation_head:
+        raise ValueError("pull request head SHA does not match implementation_head")
+    if pr.get("baseRefName") != base_branch:
+        raise ValueError("pull request base branch does not match base_branch")
+    return {"number": number, "url": url}
+
+
+def _build_review_handoff(
+    git_state: dict,
+    pr: dict,
+    *,
+    implementation_head: str,
+    base_branch: str,
+    commands: list[dict],
+) -> str:
+    """Render the single durable human Review record."""
+    planning_commit = git_state["planning"]["planning_commit"]
+    files = ", ".join(f"`{path}`" for path in git_state["changed_files"])
+    command_lines = "\n".join(
+        f"- `{item['command']}` — exit `{item['exit_code']}`" for item in commands
+    )
+    return (
+        "## Review handoff\n\n"
+        f"- Repository: `{git_state['repository']}`\n"
+        f"- Worktree: `{git_state['repo']}`\n"
+        f"- Branch: `{git_state['branch']}`\n"
+        f"- Base branch: `{base_branch}`\n"
+        f"- Planning commit: `{planning_commit}`\n"
+        f"- Implementation head: `{implementation_head}`\n"
+        f"- PR: `#{pr['number']}` — {pr['url']}\n\n"
+        "### Implementation diff\n"
+        f"- Changed files: `{len(git_state['changed_files'])}` — {files}\n"
+        f"- Summary: {git_state['diff_stat']}\n\n"
+        "### Verification\n"
+        f"{command_lines}\n\n"
+        "Human review and merge required; Instructor cannot complete this card."
+    )
+
+
+def _review_retry(kb, conn, task, args: dict, commands: list[dict], digest: str):
+    """Use only durable evidence to decide a lost-response Review retry."""
+    runs = kb.list_runs(
+        conn,
+        task.id,
+        include_active=False,
+        state_type="outcome",
+        state_name="handed_off",
+    )
+    review_run = next(
+        (
+            run
+            for run in reversed(runs)
+            if (run.metadata or {}).get("to_step") == "review"
+        ),
+        None,
+    )
+    metadata = review_run.metadata if review_run else None
+    if not isinstance(metadata, dict):
+        raise ValueError("idempotent review handoff is missing prior metadata")
+    requested_pr = str(args["pull_request"]).strip()
+    prior_pr = metadata["pull_request"]
+    pr_matches = requested_pr == prior_pr["url"] or (
+        requested_pr.isdigit() and int(requested_pr) == prior_pr["number"]
+    )
+    if (
+        not pr_matches
+        or args["implementation_head"].strip().lower()
+        != metadata["implementation_head"]
+        or args["base_branch"].strip() != metadata["base_branch"]
+        or commands != metadata["verification_commands"]
+        or digest != metadata["verification_digest"]
+    ):
+        raise ValueError("task is already in review with a different review handoff")
+    result = kb.handoff_task_to_review(
+        conn,
+        task.id,
+        body=task.body,
+        metadata=metadata,
+        expected_run_id=_worker_run_id(task.id),
+        expected_profile="instructor",
+    )
+    return result, prior_pr
+
+
+def _handle_review_handoff(args: dict, **kw) -> str:
+    """Verify local implementation + PR evidence and hand the card to Review."""
+    try:
+        pull_request, head, base, commands, digest = _validate_review_worker(args)
+        tid = _default_task_id(args.get("task_id"))
+        if not tid:
+            raise ValueError("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+        kb, conn = _connect()
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                raise ValueError(f"task {tid} not found")
+            if task.current_step_key == "review":
+                result, pr = _review_retry(kb, conn, task, args, commands, digest)
+            else:
+                git_state = _verify_review_git_state(
+                    kb, conn, task, implementation_head=head
+                )
+                pr = _verify_open_pull_request(
+                    git_state["repo"],
+                    pull_request,
+                    repository=git_state["repository"],
+                    branch=git_state["branch"],
+                    implementation_head=head,
+                    base_branch=base,
+                )
+                body = _build_review_handoff(
+                    git_state,
+                    pr,
+                    implementation_head=head,
+                    base_branch=base,
+                    commands=commands,
+                )
+                metadata = {
+                    "planning_commit": git_state["planning"]["planning_commit"],
+                    "implementation_head": head,
+                    "branch": git_state["branch"],
+                    "base_branch": base,
+                    "pull_request": pr,
+                    "verification_commands": commands,
+                    "verification_digest": digest,
+                    "publication_attempt_count": 1,
+                }
+                result = kb.handoff_task_to_review(
+                    conn,
+                    tid,
+                    body=redact_sensitive_text(body, force=True),
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id(tid),
+                    expected_profile="instructor",
+                )
+            return _ok(
+                task_id=tid,
+                phase="review",
+                run_id=result.run_id,
+                idempotent=result.idempotent,
+                pull_request=pr["url"],
+            )
+        finally:
+            conn.close()
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as e:
+        detail = redact_sensitive_text(str(e), force=True)
+        return tool_error(f"kanban_handoff: {detail}")
+
+
+def _handle_handoff(args: dict, **kw) -> str:
+    """Dispatch one same-card human-gated phase handoff."""
+    if not os.environ.get("HERMES_KANBAN_TASK", "").strip():
+        return tool_error("kanban_handoff requires a dispatcher task-scoped worker")
+    if args.get("board") not in (None, ""):
+        return tool_error("task-scoped kanban_handoff must not include a board override")
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    if args.get("to_phase") == "implementation":
+        return _handle_implementation_handoff(args, **kw)
+    if args.get("to_phase") == "review":
+        return _handle_review_handoff(args, **kw)
+    return tool_error("to_phase must be 'implementation' or 'review'")
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
@@ -2216,11 +2637,11 @@ KANBAN_PREPARE_PLANNING_SCHEMA = {
 KANBAN_HANDOFF_SCHEMA = {
     "name": "kanban_handoff",
     "description": (
-        "Atomically transform the current human-gated workflow card from "
-        "[Planning] to [Implementation]. Planner-only. Verifies a clean Git "
-        "worktree and a planning commit containing exactly the specification "
-        "and plan, computes hashes, attaches both files, generates the approval "
-        "record, assigns Instructor, and leaves the card sticky-Blocked for a human."
+        "Atomically advance the current human-gated workflow card. Planner calls "
+        "to_phase='implementation' with the planning commit and artifacts. "
+        "Instructor calls to_phase='review' with the PR identity, implementation "
+        "head, base branch, and structured verification results. Each transition "
+        "is verified fail-closed and leaves the same card blocked for a human."
     ),
     "parameters": {
         "type": "object",
@@ -2231,7 +2652,7 @@ KANBAN_HANDOFF_SCHEMA = {
             },
             "to_phase": {
                 "type": "string",
-                "enum": ["implementation"],
+                "enum": ["implementation", "review"],
             },
             "planning_commit": {
                 "type": "string",
@@ -2245,8 +2666,32 @@ KANBAN_HANDOFF_SCHEMA = {
                 "type": "string",
                 "description": "Repository-relative implementation-plan Markdown path.",
             },
+            "pull_request": {
+                "type": "string",
+                "description": "GitHub pull request URL or positive PR number.",
+            },
+            "implementation_head": {
+                "type": "string",
+                "description": "Full SHA of the clean implementation worktree HEAD.",
+            },
+            "base_branch": {
+                "type": "string",
+                "description": "Expected pull request base branch.",
+            },
+            "verification_commands": {
+                "type": "array",
+                "description": "Verification command summaries and exit codes; raw output is not accepted or persisted.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "exit_code": {"type": "integer"},
+                    },
+                    "required": ["command", "exit_code"],
+                },
+            },
         },
-        "required": ["to_phase", "planning_commit", "specification", "plan"],
+        "required": ["to_phase"],
     },
 }
 
