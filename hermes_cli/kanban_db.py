@@ -4937,23 +4937,51 @@ def handoff_task(
     return result
 
 
+_REVIEW_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_REVIEW_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+_REVIEW_PR_URL_RE = re.compile(
+    r"https://github\.com/[A-Za-z0-9][A-Za-z0-9-]{0,38}/"
+    r"[A-Za-z0-9_.-]+/pull/([1-9][0-9]*)"
+)
+
+
+def _review_text_field(metadata: dict, field_name: str) -> str:
+    """Return one bounded, canonical text evidence field."""
+    value = metadata.get(field_name)
+    if not isinstance(value, str):
+        raise ValueError(f"review handoff metadata requires {field_name}")
+    value = value.strip()
+    if not value or len(value) > 255 or value.splitlines() != [value]:
+        raise ValueError(f"review handoff metadata has invalid {field_name}")
+    return value
+
+
+def _compact_json_bytes(value: dict) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
 def _review_handoff_metadata(metadata: dict) -> tuple[dict, str]:
     """Validate and allowlist compact Review evidence and its stable identity."""
     if not isinstance(metadata, dict):
         raise ValueError("review handoff metadata must be a dict")
 
-    evidence = {}
-    for field_name in (
-        "planning_commit",
-        "implementation_head",
-        "branch",
-        "base_branch",
-        "verification_digest",
-    ):
-        value = metadata.get(field_name)
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"review handoff metadata requires {field_name}")
-        evidence[field_name] = value.strip()
+    evidence = {
+        field_name: _review_text_field(metadata, field_name)
+        for field_name in (
+            "planning_commit",
+            "implementation_head",
+            "branch",
+            "base_branch",
+            "verification_digest",
+        )
+    }
+    for field_name in ("planning_commit", "implementation_head"):
+        if _REVIEW_SHA_RE.fullmatch(evidence[field_name]) is None:
+            raise ValueError(f"review handoff metadata has invalid {field_name}")
+    if _REVIEW_DIGEST_RE.fullmatch(evidence["verification_digest"]) is None:
+        raise ValueError("review handoff metadata has invalid verification_digest")
 
     pull_request = metadata.get("pull_request")
     if not isinstance(pull_request, dict):
@@ -4962,12 +4990,16 @@ def _review_handoff_metadata(metadata: dict) -> tuple[dict, str]:
     if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number < 1:
         raise ValueError("review handoff pull_request.number must be a positive integer")
     pr_url = pull_request.get("url")
-    if not isinstance(pr_url, str) or not pr_url.strip():
+    if not isinstance(pr_url, str):
         raise ValueError("review handoff pull_request.url is required")
-    evidence["pull_request"] = {"number": pr_number, "url": pr_url.strip()}
+    pr_url = pr_url.strip()
+    url_match = _REVIEW_PR_URL_RE.fullmatch(pr_url)
+    if url_match is None or url_match.group(1) != str(pr_number):
+        raise ValueError("review handoff pull_request.url is invalid")
+    evidence["pull_request"] = {"number": pr_number, "url": pr_url}
 
     commands = metadata.get("verification_commands")
-    if not isinstance(commands, list) or not commands:
+    if not isinstance(commands, list) or not commands or len(commands) > 64:
         raise ValueError("review handoff metadata requires verification_commands")
     canonical_commands = []
     for command in commands:
@@ -4993,6 +5025,9 @@ def _review_handoff_metadata(metadata: dict) -> tuple[dict, str]:
         )
     evidence["publication_attempt_count"] = attempts
 
+    if len(_compact_json_bytes(evidence)) > 32 * 1024:
+        raise ValueError("review handoff evidence exceeds 32 KiB")
+
     stable_identity = {
         key: evidence[key]
         for key in (
@@ -5004,10 +5039,7 @@ def _review_handoff_metadata(metadata: dict) -> tuple[dict, str]:
             "verification_digest",
         )
     }
-    encoded = json.dumps(
-        stable_identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return evidence, hashlib.sha256(encoded).hexdigest()
+    return evidence, hashlib.sha256(_compact_json_bytes(stable_identity)).hexdigest()
 
 
 def _validate_review_handoff_authority(
@@ -5159,6 +5191,56 @@ def _apply_review_handoff_transition(
     )
 
 
+def _review_handoff_retry(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    handoff_id: str,
+    expected_run_id: int,
+) -> Optional[ReviewHandoffResult]:
+    """Return a validated idempotent result when Review is already durable."""
+    if task.current_step_key != "review":
+        return None
+    if (
+        task.workflow_template_id != HUMAN_GATED_WORKFLOW_ID
+        or task.status != "blocked"
+        or task.assignee is not None
+        or task.current_run_id is not None
+        or task.claim_lock is not None
+        or task.claim_expires is not None
+        or task.worker_pid is not None
+    ):
+        raise ValueError(
+            f"idempotent review handoff task state is invalid for {task.id}"
+        )
+
+    event = conn.execute(
+        "SELECT payload, run_id FROM task_events "
+        "WHERE task_id = ? AND kind = 'phase_handoff' "
+        "ORDER BY id DESC LIMIT 1",
+        (task.id,),
+    ).fetchone()
+    payload = json.loads(event["payload"]) if event and event["payload"] else {}
+    if (
+        payload.get("workflow_template_id") != HUMAN_GATED_WORKFLOW_ID
+        or payload.get("from_step") != "implementation"
+        or payload.get("to_step") != "review"
+    ):
+        raise ValueError(f"idempotent review handoff event scope is invalid for {task.id}")
+    if payload.get("handoff_id") != handoff_id:
+        raise ValueError(
+            f"task {task.id} is already in review with a different review handoff"
+        )
+    if not event or int(event["run_id"] or 0) != expected_run_id:
+        raise ValueError(f"stale review handoff run for {task.id}")
+    return ReviewHandoffResult(
+        task_id=task.id,
+        run_id=expected_run_id,
+        handoff_id=handoff_id,
+        idempotent=True,
+    )
+
+
 def handoff_task_to_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5204,46 +5286,11 @@ def handoff_task_to_review(
             raise ValueError(f"unknown task {task_id}")
         task = Task.from_row(row)
 
-        if task.current_step_key == "review":
-            if (
-                task.workflow_template_id != HUMAN_GATED_WORKFLOW_ID
-                or task.status != "blocked"
-                or task.assignee is not None
-                or task.current_run_id is not None
-                or task.claim_lock is not None
-                or task.claim_expires is not None
-                or task.worker_pid is not None
-            ):
-                raise ValueError(
-                    f"idempotent review handoff task state is invalid for {task_id}"
-                )
-            event = conn.execute(
-                "SELECT payload, run_id FROM task_events "
-                "WHERE task_id = ? AND kind = 'phase_handoff' "
-                "ORDER BY id DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-            payload = json.loads(event["payload"]) if event and event["payload"] else {}
-            if (
-                payload.get("workflow_template_id") != HUMAN_GATED_WORKFLOW_ID
-                or payload.get("from_step") != "implementation"
-                or payload.get("to_step") != "review"
-            ):
-                raise ValueError(
-                    f"idempotent review handoff event scope is invalid for {task_id}"
-                )
-            if payload.get("handoff_id") != handoff_id:
-                raise ValueError(
-                    f"task {task_id} is already in review with a different review handoff"
-                )
-            if not event or int(event["run_id"] or 0) != expected_run_id:
-                raise ValueError(f"stale review handoff run for {task_id}")
-            return ReviewHandoffResult(
-                task_id=task_id,
-                run_id=expected_run_id,
-                handoff_id=handoff_id,
-                idempotent=True,
-            )
+        retry = _review_handoff_retry(
+            conn, task, handoff_id=handoff_id, expected_run_id=expected_run_id
+        )
+        if retry is not None:
+            return retry
 
         _validate_review_handoff_authority(conn, task, expected_run_id, evidence)
         result = _apply_review_handoff_transition(

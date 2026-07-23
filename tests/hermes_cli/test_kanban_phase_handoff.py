@@ -252,6 +252,127 @@ def test_review_handoff_rejects_failed_or_malformed_verification_without_mutatio
         ]
 
 
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"planning_commit": "A" * 40}, "planning_commit"),
+        ({"implementation_head": "b" * 39}, "implementation_head"),
+        ({"verification_digest": "C" * 64}, "verification_digest"),
+        ({"branch": "feat/audit\nlogging"}, "branch"),
+        ({"branch": "x" * 256}, "branch"),
+        ({"base_branch": "main\rnext"}, "base_branch"),
+        ({"base_branch": "x" * 256}, "base_branch"),
+        ({"pull_request": {"number": 0, "url": "https://github.com/o/r/pull/0"}}, "number"),
+        (
+            {
+                "pull_request": {
+                    "number": 42,
+                    "url": "https://token@github.com/o/r/pull/42",
+                }
+            },
+            "url",
+        ),
+        (
+            {
+                "pull_request": {
+                    "number": 42,
+                    "url": "https://github.com/o/r/pull/42?token=secret",
+                }
+            },
+            "url",
+        ),
+        (
+            {
+                "pull_request": {
+                    "number": 42,
+                    "url": "https://github.com/o/r/pull/42#review",
+                }
+            },
+            "url",
+        ),
+        (
+            {
+                "pull_request": {
+                    "number": 42,
+                    "url": "https://github.com/o/r/pull/43",
+                }
+            },
+            "url",
+        ),
+        (
+            {
+                "verification_commands": [
+                    {"command": f"check-{index}", "exit_code": 0}
+                    for index in range(65)
+                ]
+            },
+            "verification_commands",
+        ),
+        (
+            {
+                "verification_commands": [
+                    {"command": "x" * 500, "exit_code": 0}
+                    for _ in range(64)
+                ]
+            },
+            "32 KiB",
+        ),
+    ],
+)
+def test_review_handoff_rejects_noncanonical_or_oversized_evidence_without_mutation(
+    kanban_home, overrides, match
+):
+    with kb.connect() as conn:
+        _, task_id, run_id = _claimed_implementation_task(conn)
+        before = kb.get_task(conn, task_id)
+        before_run = kb.latest_run(conn, task_id)
+
+        with pytest.raises(ValueError, match=match):
+            kb.handoff_task_to_review(
+                conn,
+                task_id,
+                body="review body",
+                metadata=_review_metadata(**overrides),
+                expected_run_id=run_id,
+                expected_profile="instructor",
+            )
+
+        assert kb.get_task(conn, task_id) == before
+        assert kb.latest_run(conn, task_id) == before_run
+        assert not [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "phase_handoff" and event.payload.get("to_step") == "review"
+        ]
+
+
+def test_review_handoff_accepts_bounded_evidence_limits(kanban_home):
+    with kb.connect() as conn:
+        _, task_id, run_id = _claimed_implementation_task(conn)
+        metadata = _review_metadata(
+            branch="x" * 255,
+            base_branch="y" * 255,
+            verification_commands=[
+                {"command": f"check-{index}", "exit_code": 0} for index in range(64)
+            ],
+        )
+        conn.execute(
+            "UPDATE tasks SET branch_name = ? WHERE id = ?", (metadata["branch"], task_id)
+        )
+
+        result = kb.handoff_task_to_review(
+            conn,
+            task_id,
+            body="review body",
+            metadata=metadata,
+            expected_run_id=run_id,
+            expected_profile="instructor",
+        )
+
+        assert result.idempotent is False
+        assert len(kb.latest_run(conn, task_id).metadata["verification_commands"]) == 64
+
+
 @pytest.mark.parametrize("profile", ["Instructor", " instructor", "instructor "])
 def test_review_handoff_requires_exact_instructor_profile_without_mutation(
     kanban_home, profile
@@ -341,7 +462,10 @@ def test_review_handoff_rejects_invalid_authority_without_mutation(
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [
-        ("pull_request", {"number": 43, "url": "https://example.test/pull/43"}),
+        (
+            "pull_request",
+            {"number": 43, "url": "https://github.com/NousResearch/hermes-agent/pull/43"},
+        ),
         ("implementation_head", "d" * 40),
         ("branch", "feat/other"),
         ("verification_digest", "e" * 64),
