@@ -162,6 +162,117 @@ def test_review_handoff_atomically_closes_instructor_run_and_preserves_card(
         assert events[0].payload["handoff_id"] == result.handoff_id
 
 
+def test_review_handoff_persists_only_canonical_compact_evidence(kanban_home):
+    with kb.connect() as conn:
+        _, task_id, run_id = _claimed_implementation_task(conn)
+        metadata = _review_metadata(secret_token="never persist", raw_output="nope")
+        metadata["pull_request"].update(
+            {"url": f"  {metadata['pull_request']['url']}  ", "token": "nope"}
+        )
+        metadata["verification_commands"][0].update(
+            {"command": "  pytest -q  ", "raw_output": "nope"}
+        )
+
+        kb.handoff_task_to_review(
+            conn,
+            task_id,
+            body="review body",
+            metadata=metadata,
+            expected_run_id=run_id,
+            expected_profile="instructor",
+        )
+
+        run_metadata = kb.latest_run(conn, task_id).metadata
+        assert set(run_metadata) == {
+            "planning_commit",
+            "implementation_head",
+            "branch",
+            "base_branch",
+            "pull_request",
+            "verification_commands",
+            "verification_digest",
+            "publication_attempt_count",
+            "workflow_template_id",
+            "from_step",
+            "to_step",
+            "handoff_id",
+            "implementation_body",
+        }
+        assert run_metadata["pull_request"] == {
+            "number": 42,
+            "url": "https://github.com/NousResearch/hermes-agent/pull/42",
+        }
+        assert run_metadata["verification_commands"] == [
+            {"command": "pytest -q", "exit_code": 0}
+        ]
+        event = next(
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "phase_handoff" and event.payload.get("to_step") == "review"
+        )
+        assert event.payload["metadata"] == run_metadata
+
+
+@pytest.mark.parametrize(
+    "commands",
+    [
+        [{"command": "pytest -q", "exit_code": 1}],
+        [{"command": "", "exit_code": 0}],
+        [{"command": "   ", "exit_code": 0}],
+        [{"command": "pytest -q\nraw output", "exit_code": 0}],
+        [{"command": "x" * 501, "exit_code": 0}],
+    ],
+)
+def test_review_handoff_rejects_failed_or_malformed_verification_without_mutation(
+    kanban_home, commands
+):
+    with kb.connect() as conn:
+        _, task_id, run_id = _claimed_implementation_task(conn)
+        before = kb.get_task(conn, task_id)
+        before_run = kb.latest_run(conn, task_id)
+
+        with pytest.raises(ValueError, match="verification_commands"):
+            kb.handoff_task_to_review(
+                conn,
+                task_id,
+                body="review body",
+                metadata=_review_metadata(verification_commands=commands),
+                expected_run_id=run_id,
+                expected_profile="instructor",
+            )
+
+        after = kb.get_task(conn, task_id)
+        after_run = kb.latest_run(conn, task_id)
+        assert after == before
+        assert after_run == before_run
+        assert not [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "phase_handoff" and event.payload.get("to_step") == "review"
+        ]
+
+
+@pytest.mark.parametrize("profile", ["Instructor", " instructor", "instructor "])
+def test_review_handoff_requires_exact_instructor_profile_without_mutation(
+    kanban_home, profile
+):
+    with kb.connect() as conn:
+        _, task_id, run_id = _claimed_implementation_task(conn)
+        before = kb.get_task(conn, task_id)
+
+        with pytest.raises(ValueError, match="expected profile 'instructor'"):
+            kb.handoff_task_to_review(
+                conn,
+                task_id,
+                body="review body",
+                metadata=_review_metadata(),
+                expected_run_id=run_id,
+                expected_profile=profile,
+            )
+
+        assert kb.get_task(conn, task_id) == before
+
+
 @pytest.mark.parametrize(
     ("corruption", "match"),
     [
