@@ -34,6 +34,7 @@ import logging
 import mimetypes
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 from typing import Any, Optional
@@ -1417,7 +1418,27 @@ def _validate_review_worker(args: dict) -> tuple[str, str, str, list[dict], str]
             )
         if exit_code != 0:
             raise ValueError("verification_commands must all have exit_code 0")
-        canonical_commands.append({"command": command.strip(), "exit_code": 0})
+        try:
+            safe_command = redact_sensitive_text(
+                command.strip(),
+                force=True,
+                file_read=True,
+                redact_url_credentials=True,
+            )
+        except Exception:
+            raise ValueError(
+                "verification command evidence could not be safely redacted"
+            ) from None
+        if not isinstance(safe_command, str) or not safe_command.strip():
+            raise ValueError(
+                "verification command evidence could not be safely redacted"
+            )
+        safe_command = re.sub(
+            r"((?:[A-Za-z][A-Za-z0-9+.-]*:)?//)[^/\s?#@]+@",
+            r"\1***@",
+            safe_command,
+        )
+        canonical_commands.append({"command": safe_command.strip(), "exit_code": 0})
     verification_digest = hashlib.sha256(
         json.dumps(
             canonical_commands, sort_keys=True, separators=(",", ":")
@@ -1777,7 +1798,14 @@ def _handle_review_handoff(args: dict, **kw) -> str:
         finally:
             conn.close()
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as e:
-        detail = redact_sensitive_text(str(e), force=True)
+        try:
+            detail = redact_sensitive_text(
+                str(e), force=True, redact_url_credentials=True
+            )
+        except Exception:
+            detail = "review evidence could not be safely redacted"
+        if not isinstance(detail, str):
+            detail = "verification command evidence could not be safely redacted"
         return tool_error(f"kanban_handoff: {detail}")
 
 

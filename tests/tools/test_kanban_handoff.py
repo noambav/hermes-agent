@@ -1019,6 +1019,146 @@ def test_review_handoff_requires_inputs_and_instructor_profile(
     )
 
 
+def test_review_handoff_rejects_stale_worker_run(implementation_worker, monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv(
+        "HERMES_KANBAN_RUN_ID", str(implementation_worker["run_id"] + 1)
+    )
+
+    assert "stale review handoff run" in kt._handle_handoff(
+        _review_args(implementation_worker)
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("realpath", "differs from Planning repository"),
+        ("branch", "current branch does not match the task branch"),
+    ],
+)
+def test_review_handoff_rejects_wrong_worktree_realpath_or_branch(
+    implementation_worker, tmp_path, mutation, message
+):
+    from tools import kanban_tools as kt
+
+    if mutation == "realpath":
+        other = tmp_path / "other-repo"
+        subprocess.run(
+            ["git", "clone", "--quiet", str(implementation_worker["repo"]), str(other)],
+            check=True,
+        )
+        with kb.connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+                (str(other), implementation_worker["task_id"]),
+            )
+    else:
+        with kb.connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET branch_name = 'other' WHERE id = ?",
+                (implementation_worker["task_id"],),
+            )
+
+    assert message in kt._handle_handoff(_review_args(implementation_worker))
+
+
+def test_review_handoff_rejects_non_ancestor_planning_commit(
+    implementation_worker, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    repo = implementation_worker["repo"]
+    subprocess.run(["git", "-C", str(repo), "checkout", "--orphan", "other"], check=True)
+    subprocess.run(["git", "-C", str(repo), "rm", "-rf", "."], check=True, capture_output=True)
+    (repo / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "unrelated.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "unrelated implementation"],
+        check=True,
+        capture_output=True,
+    )
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET branch_name = 'other' WHERE id = ?",
+            (implementation_worker["task_id"],),
+        )
+    monkeypatch.setenv(
+        "GH_FAKE_OUTPUT", json.dumps({**implementation_worker["pr"], "headRefName": "other", "headRefOid": head})
+    )
+
+    assert "planning commit must be an ancestor" in kt._handle_handoff(
+        _review_args(implementation_worker, implementation_head=head)
+    )
+
+
+def test_review_handoff_rejects_empty_implementation_range(
+    implementation_worker, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(implementation_worker["repo"]),
+            "reset",
+            "--hard",
+            implementation_worker["planning_commit"],
+        ],
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setenv(
+        "GH_FAKE_OUTPUT",
+        json.dumps(
+            {
+                **implementation_worker["pr"],
+                "headRefOid": implementation_worker["planning_commit"],
+            }
+        ),
+    )
+
+    assert "implementation range must be non-empty" in kt._handle_handoff(
+        _review_args(
+            implementation_worker,
+            implementation_head=implementation_worker["planning_commit"],
+        )
+    )
+
+
+def test_review_handoff_rejects_planning_git_blob_hash_mismatch(
+    implementation_worker,
+):
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        planning_run = kb.list_runs(
+            conn,
+            implementation_worker["task_id"],
+            include_active=False,
+            state_type="outcome",
+            state_name="handed_off",
+        )[0]
+        metadata = planning_run.metadata
+        metadata["specification"]["sha256"] = "f" * 64
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata), planning_run.id),
+        )
+
+    assert "Git blob hash does not match authorization" in kt._handle_handoff(
+        _review_args(implementation_worker)
+    )
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -1114,6 +1254,91 @@ def test_review_handoff_rejects_missing_or_ambiguous_pr_and_redacts_error(
     out = kt._handle_handoff(_review_args(implementation_worker))
     assert token not in out
     assert "gh pr view failed" in out
+
+
+def test_review_handoff_excludes_origin_and_command_credentials_from_metadata(
+    implementation_worker,
+):
+    from tools import kanban_tools as kt
+
+    origin_password = "origin-password-secret"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(implementation_worker["repo"]),
+            "remote",
+            "set-url",
+            "origin",
+            f"https://build:{origin_password}@github.com/NousResearch/hermes-agent.git",
+        ],
+        check=True,
+    )
+    out = kt._handle_handoff(_review_args(implementation_worker))
+    assert "credential-free GitHub URL" in out
+
+    with kb.connect() as conn:
+        events = kb.list_events(conn, implementation_worker["task_id"])
+        runs = kb.list_runs(conn, implementation_worker["task_id"])
+    persisted = json.dumps(
+        {
+            "events": [event.payload for event in events],
+            "runs": [run.metadata for run in runs],
+        }
+    )
+    assert origin_password not in persisted
+
+
+def test_review_handoff_redacts_command_credentials_before_digest_and_persistence(
+    implementation_worker,
+):
+    from tools import kanban_tools as kt
+
+    token = "ghp_FAKECOMMANDTOKEN123456789012345"
+    password = "command-url-password"
+    args = _review_args(
+        implementation_worker,
+        verification_commands=[
+            {
+                "command": (
+                    f"curl -H 'Authorization: Bearer {token}' "
+                    f"https://worker:{password}@example.test/check"
+                ),
+                "exit_code": 0,
+            }
+        ],
+    )
+    result = json.loads(kt._handle_handoff(args))
+    assert result["ok"] is True
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, implementation_worker["task_id"])
+        run = kb.latest_run(conn, implementation_worker["task_id"])
+        events = kb.list_events(conn, implementation_worker["task_id"])
+    assert task is not None and run is not None
+    persisted = json.dumps(
+        {"body": task.body, "metadata": run.metadata, "events": [e.payload for e in events]}
+    )
+    assert token not in persisted
+    assert password not in persisted
+    assert "worker:" not in persisted
+    assert run.metadata["verification_digest"] == hashlib.sha256(
+        json.dumps(
+            run.metadata["verification_commands"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def test_review_handoff_fails_closed_when_command_redaction_is_unavailable(
+    implementation_worker, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "redact_sensitive_text", lambda *args, **kwargs: None)
+    out = kt._handle_handoff(_review_args(implementation_worker))
+    assert "verification command evidence could not be safely redacted" in out
 
 
 def test_review_handoff_retry_is_idempotent_and_conflict_fails(
