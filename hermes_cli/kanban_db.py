@@ -131,13 +131,15 @@ HUMAN_GATED_WORKFLOW_ID = "human-gated-development-v1"
 HUMAN_GATED_PHASE_PREFIXES = {
     "planning": "[Planning]",
     "implementation": "[Implementation]",
+    "review": "[Review]",
 }
 HUMAN_GATED_PHASE_ASSIGNEES = {
     "planning": "planner",
     "implementation": "instructor",
+    "review": None,
 }
 _HUMAN_GATED_PREFIX_RE = re.compile(
-    r"^\[(?:Planning|Implementation)\]\s*",
+    r"^\[(?:Planning|Implementation|Review)\]\s*",
     re.IGNORECASE,
 )
 
@@ -1036,6 +1038,16 @@ class PhaseHandoffResult:
     from_step: str
     to_step: str
     run_id: Optional[int]
+    idempotent: bool = False
+
+
+@dataclass(frozen=True)
+class ReviewHandoffResult:
+    """Result of the human-gated Implementation-to-Review transition."""
+
+    task_id: str
+    run_id: int
+    handoff_id: str
     idempotent: bool = False
 
 
@@ -3849,10 +3861,20 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 def _requires_done_only_parent_gate(
     workflow_template_id: Optional[str], current_step_key: Optional[str]
 ) -> bool:
-    """Human-gated Planning waits for a parent to reach Done, not Archived."""
+    """Every human-gated phase waits for parents to reach Done."""
     return (
         workflow_template_id == HUMAN_GATED_WORKFLOW_ID
-        and current_step_key == "planning"
+        and current_step_key in HUMAN_GATED_PHASE_PREFIXES
+    )
+
+
+def _is_human_review_gate(
+    workflow_template_id: Optional[str], current_step_key: Optional[str]
+) -> bool:
+    """Return whether dispatcher automation must leave this card blocked."""
+    return (
+        workflow_template_id == HUMAN_GATED_WORKFLOW_ID
+        and current_step_key == "review"
     )
 
 
@@ -3899,6 +3921,10 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if cur_status == "blocked" and _is_human_review_gate(
+                row["workflow_template_id"], row["current_step_key"]
+            ):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4908,6 +4934,288 @@ def handoff_task(
         )
     if result is None:
         raise RuntimeError("phase handoff completed without a result")
+    return result
+
+
+def _review_handoff_metadata(metadata: dict) -> tuple[dict, str]:
+    """Validate durable Review evidence and derive its stable identity."""
+    if not isinstance(metadata, dict):
+        raise ValueError("review handoff metadata must be a dict")
+    evidence = dict(metadata)
+    for field_name in (
+        "planning_commit",
+        "implementation_head",
+        "branch",
+        "base_branch",
+        "verification_digest",
+    ):
+        if not isinstance(evidence.get(field_name), str) or not evidence[field_name].strip():
+            raise ValueError(f"review handoff metadata requires {field_name}")
+
+    pull_request = evidence.get("pull_request")
+    if not isinstance(pull_request, dict):
+        raise ValueError("review handoff metadata requires pull_request identity")
+    pr_number = pull_request.get("number")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number < 1:
+        raise ValueError("review handoff pull_request.number must be a positive integer")
+    if not isinstance(pull_request.get("url"), str) or not pull_request["url"].strip():
+        raise ValueError("review handoff pull_request.url is required")
+
+    commands = evidence.get("verification_commands")
+    if not isinstance(commands, list) or not commands:
+        raise ValueError("review handoff metadata requires verification_commands")
+    for command in commands:
+        if (
+            not isinstance(command, dict)
+            or not isinstance(command.get("command"), str)
+            or not command["command"].strip()
+            or isinstance(command.get("exit_code"), bool)
+            or not isinstance(command.get("exit_code"), int)
+        ):
+            raise ValueError("review handoff verification_commands are invalid")
+    attempts = evidence.get("publication_attempt_count")
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+        raise ValueError(
+            "review handoff publication_attempt_count must be a positive integer"
+        )
+
+    stable_identity = {
+        key: evidence[key]
+        for key in (
+            "planning_commit",
+            "implementation_head",
+            "branch",
+            "base_branch",
+            "pull_request",
+            "verification_digest",
+        )
+    }
+    encoded = json.dumps(
+        stable_identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return evidence, hashlib.sha256(encoded).hexdigest()
+
+
+def handoff_task_to_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    body: str,
+    metadata: dict,
+    expected_run_id: Optional[int],
+    expected_profile: str,
+) -> ReviewHandoffResult:
+    """Atomically hand one claimed Implementation card to human Review.
+
+    Repository and pull-request validation belongs to the caller. This kernel
+    edge verifies the durable evidence shape and exact task/run snapshot, then
+    closes the Instructor run and leaves the same card blocked and unassigned.
+    """
+    if not isinstance(body, str) or not body.strip():
+        raise ValueError("review handoff body is required")
+    if expected_run_id is None:
+        raise ValueError("review handoff requires expected_run_id")
+    if str(expected_profile or "").strip().casefold() != "instructor":
+        raise ValueError("review handoff requires expected profile 'instructor'")
+    evidence, handoff_id = _review_handoff_metadata(metadata)
+    expected_run_id = int(expected_run_id)
+    result: Optional[ReviewHandoffResult] = None
+    transaction_state = WriteTxnState()
+
+    def _notify_if_committed() -> None:
+        if transaction_state.committed and result and not result.idempotent:
+            _fire_kanban_lifecycle_hook(
+                "kanban_task_blocked",
+                result.task_id,
+                board=get_current_board(),
+                assignee=None,
+                run_id=result.run_id,
+                reason="approval-required: review",
+            )
+
+    with contextlib.ExitStack() as stack:
+        stack.callback(_notify_if_committed)
+        stack.enter_context(write_txn(conn, state=transaction_state))
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+        task = Task.from_row(row)
+
+        if task.current_step_key == "review":
+            if (
+                task.workflow_template_id != HUMAN_GATED_WORKFLOW_ID
+                or task.status != "blocked"
+                or task.assignee is not None
+                or task.current_run_id is not None
+                or task.claim_lock is not None
+                or task.claim_expires is not None
+                or task.worker_pid is not None
+            ):
+                raise ValueError(
+                    f"idempotent review handoff task state is invalid for {task_id}"
+                )
+            event = conn.execute(
+                "SELECT payload, run_id FROM task_events "
+                "WHERE task_id = ? AND kind = 'phase_handoff' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            payload = json.loads(event["payload"]) if event and event["payload"] else {}
+            if (
+                payload.get("workflow_template_id") != HUMAN_GATED_WORKFLOW_ID
+                or payload.get("from_step") != "implementation"
+                or payload.get("to_step") != "review"
+            ):
+                raise ValueError(
+                    f"idempotent review handoff event scope is invalid for {task_id}"
+                )
+            if payload.get("handoff_id") != handoff_id:
+                raise ValueError(
+                    f"task {task_id} is already in review with a different review handoff"
+                )
+            if not event or int(event["run_id"] or 0) != expected_run_id:
+                raise ValueError(f"stale review handoff run for {task_id}")
+            return ReviewHandoffResult(
+                task_id=task_id,
+                run_id=expected_run_id,
+                handoff_id=handoff_id,
+                idempotent=True,
+            )
+
+        if task.workflow_template_id != HUMAN_GATED_WORKFLOW_ID:
+            raise ValueError(
+                f"task {task_id} is not in workflow {HUMAN_GATED_WORKFLOW_ID!r}"
+            )
+        if task.current_step_key != "implementation":
+            raise ValueError(
+                f"invalid phase transition {task.current_step_key!r} -> 'review'"
+            )
+        if task.status != "running":
+            raise ValueError(f"task {task_id} must be running for review handoff")
+        if task.assignee != "instructor":
+            raise ValueError(
+                f"review handoff requires assignee 'instructor', got {task.assignee!r}"
+            )
+        if task.current_run_id != expected_run_id:
+            raise ValueError(f"stale review handoff run for {task_id}")
+        source_prefix = HUMAN_GATED_PHASE_PREFIXES["implementation"]
+        if not task.title.startswith(f"{source_prefix} "):
+            raise ValueError(
+                f"review handoff requires exact {source_prefix} title prefix"
+            )
+        if not task.branch_name or evidence["branch"] != task.branch_name:
+            raise ValueError("review handoff branch does not match the task branch")
+
+        run = conn.execute(
+            "SELECT * FROM task_runs WHERE id = ? AND task_id = ?",
+            (expected_run_id, task_id),
+        ).fetchone()
+        if run is None or run["profile"] != "instructor":
+            raise ValueError("review handoff requires the exact Instructor run profile")
+        if (
+            run["step_key"] != "implementation"
+            or run["status"] != "running"
+            or run["ended_at"] is not None
+            or run["claim_lock"] != task.claim_lock
+        ):
+            raise ValueError("stale review handoff Instructor run snapshot")
+
+        planning_run = conn.execute(
+            "SELECT metadata FROM task_runs "
+            "WHERE task_id = ? AND step_key = 'planning' AND outcome = 'handed_off' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        planning_metadata = (
+            json.loads(planning_run["metadata"])
+            if planning_run and planning_run["metadata"]
+            else {}
+        )
+        if planning_metadata.get("planning_commit") != evidence["planning_commit"]:
+            raise ValueError("review handoff planning_commit is not authorized")
+
+        next_title = _title_for_human_gated_phase(task.title, "review")
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET title = ?, body = ?, assignee = NULL, status = 'blocked',
+                   current_step_key = 'review', claim_lock = NULL,
+                   claim_expires = NULL, worker_pid = NULL,
+                   block_kind = NULL, block_recurrences = 0,
+                   consecutive_failures = 0, last_failure_error = NULL
+             WHERE id = ?
+               AND workflow_template_id = ?
+               AND current_step_key = 'implementation'
+               AND assignee = 'instructor'
+               AND status = 'running'
+               AND current_run_id = ?
+               AND EXISTS (
+                   SELECT 1 FROM task_runs r
+                    WHERE r.id = tasks.current_run_id
+                      AND r.task_id = tasks.id
+                      AND r.profile = 'instructor'
+                      AND r.step_key = 'implementation'
+                      AND r.status = 'running'
+                      AND r.ended_at IS NULL
+                      AND r.claim_lock = tasks.claim_lock
+               )
+            """,
+            (
+                next_title,
+                body.strip(),
+                task_id,
+                HUMAN_GATED_WORKFLOW_ID,
+                expected_run_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(f"review handoff lost ownership of {task_id}")
+
+        run_metadata = dict(evidence)
+        run_metadata.update(
+            {
+                "workflow_template_id": HUMAN_GATED_WORKFLOW_ID,
+                "from_step": "implementation",
+                "to_step": "review",
+                "handoff_id": handoff_id,
+                "implementation_body": task.body,
+            }
+        )
+        closed_run_id = _end_run(
+            conn,
+            task_id,
+            outcome="handed_off",
+            status="blocked",
+            summary="Verified implementation published; awaiting human review.",
+            metadata=run_metadata,
+        )
+        if closed_run_id != expected_run_id:
+            raise RuntimeError(f"review handoff failed to close run {expected_run_id}")
+        _append_event(
+            conn,
+            task_id,
+            "phase_handoff",
+            {
+                "workflow_template_id": HUMAN_GATED_WORKFLOW_ID,
+                "from_step": "implementation",
+                "to_step": "review",
+                "from_title": task.title,
+                "from_body": task.body,
+                "to_title": next_title,
+                "handoff_id": handoff_id,
+                "metadata": run_metadata,
+            },
+            run_id=closed_run_id,
+        )
+        result = ReviewHandoffResult(
+            task_id=task_id,
+            run_id=closed_run_id,
+            handoff_id=handoff_id,
+            idempotent=False,
+        )
+
+    if result is None:
+        raise RuntimeError("review handoff completed without a result")
     return result
 
 

@@ -45,6 +45,271 @@ def _claimed_planning_task(conn, *, title: str = "[Planning] Add audit logging")
     return parent, child, claimed.current_run_id
 
 
+def _review_metadata(**overrides):
+    metadata = {
+        "planning_commit": "a" * 40,
+        "implementation_head": "b" * 40,
+        "branch": "feat/audit-logging",
+        "base_branch": "main",
+        "pull_request": {
+            "number": 42,
+            "url": "https://github.com/NousResearch/hermes-agent/pull/42",
+        },
+        "verification_commands": [
+            {"command": "python -m pytest tests/audit -q", "exit_code": 0}
+        ],
+        "verification_digest": "c" * 64,
+        "publication_attempt_count": 1,
+    }
+    metadata.update(overrides)
+    return metadata
+
+
+def _claimed_implementation_task(conn):
+    parent, task_id, planning_run_id = _claimed_planning_task(conn)
+    conn.execute(
+        "UPDATE tasks SET priority = 17, branch_name = ?, project_id = ? WHERE id = ?",
+        ("feat/audit-logging", "hermes-agent", task_id),
+    )
+    kb.handoff_task(
+        conn,
+        task_id,
+        to_step="implementation",
+        body="## Implementation handoff\n\nPlanning authorization is durable.",
+        metadata={"planning_commit": "a" * 40},
+        transition_key=f"implementation:{'a' * 40}",
+        expected_run_id=planning_run_id,
+    )
+    assert kb.unblock_task(conn, task_id) is True
+    claimed = kb.claim_task(conn, task_id, claimer="instructor:test")
+    assert claimed is not None
+    return parent, task_id, claimed.current_run_id
+
+
+def test_review_handoff_atomically_closes_instructor_run_and_preserves_card(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        parent, task_id, run_id = _claimed_implementation_task(conn)
+        comment_id = kb.add_comment(
+            conn, task_id, author="human", body="Keep review on this card"
+        )
+        attachment_id = kb.add_attachment(
+            conn,
+            task_id,
+            filename="plan.md",
+            stored_path="/tmp/plan.md",
+            size=12,
+            uploaded_by="planner",
+        )
+        conn.execute(
+            "UPDATE tasks SET worker_pid = 1234 WHERE id = ?",
+            (task_id,),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = 1234 WHERE id = ?",
+            (run_id,),
+        )
+        implementation_body = kb.get_task(conn, task_id).body
+
+        result = kb.handoff_task_to_review(
+            conn,
+            task_id,
+            body="## Review handoff\n\nHuman review and merge required.",
+            metadata=_review_metadata(),
+            expected_run_id=run_id,
+            expected_profile="instructor",
+        )
+
+        task = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+        assert result.task_id == task_id
+        assert result.run_id == run_id
+        assert result.idempotent is False
+        assert task is not None
+        assert task.title == "[Review] Add audit logging"
+        assert task.body.startswith("## Review handoff")
+        assert task.current_step_key == "review"
+        assert task.status == "blocked"
+        assert task.assignee is None
+        assert task.current_run_id is None
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
+        assert task.workspace_kind == "dir"
+        assert task.workspace_path == "/tmp/project"
+        assert task.branch_name == "feat/audit-logging"
+        assert task.project_id == "hermes-agent"
+        assert task.priority == 17
+        assert kb.parent_ids(conn, task_id) == [parent]
+        assert kb.list_comments(conn, task_id)[0].id == comment_id
+        assert kb.list_attachments(conn, task_id)[0].id == attachment_id
+        assert run is not None
+        assert run.status == "blocked"
+        assert run.outcome == "handed_off"
+        assert run.worker_pid is None
+        assert run.metadata["implementation_body"] == implementation_body
+        assert run.metadata["planning_commit"] == "a" * 40
+
+        events = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "phase_handoff"
+            and event.payload.get("to_step") == "review"
+        ]
+        assert len(events) == 1
+        assert events[0].payload["from_body"] == implementation_body
+        assert events[0].payload["handoff_id"] == result.handoff_id
+
+
+@pytest.mark.parametrize(
+    ("corruption", "match"),
+    [
+        ("stale_run", "stale"),
+        ("wrong_profile", "profile"),
+        ("wrong_phase", "transition"),
+        ("wrong_workflow", "workflow"),
+        ("missing_planning_authorization", "planning_commit"),
+        ("branch_mismatch", "branch"),
+    ],
+)
+def test_review_handoff_rejects_invalid_authority_without_mutation(
+    kanban_home, corruption, match
+):
+    with kb.connect() as conn:
+        _, task_id, run_id = _claimed_implementation_task(conn)
+        expected_run_id = run_id
+        metadata = _review_metadata()
+        if corruption == "stale_run":
+            expected_run_id += 1
+        elif corruption == "wrong_profile":
+            conn.execute("UPDATE task_runs SET profile = 'planner' WHERE id = ?", (run_id,))
+        elif corruption == "wrong_phase":
+            conn.execute("UPDATE tasks SET current_step_key = 'planning' WHERE id = ?", (task_id,))
+        elif corruption == "wrong_workflow":
+            conn.execute(
+                "UPDATE tasks SET workflow_template_id = 'other-v1' WHERE id = ?",
+                (task_id,),
+            )
+        elif corruption == "missing_planning_authorization":
+            metadata.pop("planning_commit")
+        else:
+            metadata["branch"] = "feat/other"
+        before = kb.get_task(conn, task_id)
+        before_run = kb.latest_run(conn, task_id)
+
+        with pytest.raises(ValueError, match=match):
+            kb.handoff_task_to_review(
+                conn,
+                task_id,
+                body="review body",
+                metadata=metadata,
+                expected_run_id=expected_run_id,
+                expected_profile="instructor",
+            )
+
+        after = kb.get_task(conn, task_id)
+        after_run = kb.latest_run(conn, task_id)
+        assert before is not None and after is not None
+        assert after.title == before.title
+        assert after.body == before.body
+        assert after.status == before.status
+        assert after.current_step_key == before.current_step_key
+        assert after.current_run_id == before.current_run_id
+        assert before_run is not None and after_run is not None
+        assert after_run.status == before_run.status
+        assert after_run.ended_at == before_run.ended_at
+        assert not [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "phase_handoff"
+            and event.payload.get("to_step") == "review"
+        ]
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("pull_request", {"number": 43, "url": "https://example.test/pull/43"}),
+        ("implementation_head", "d" * 40),
+        ("branch", "feat/other"),
+        ("verification_digest", "e" * 64),
+    ],
+)
+def test_review_handoff_retry_is_idempotent_and_rejects_conflicts(
+    kanban_home, field, replacement
+):
+    with kb.connect() as conn:
+        _, task_id, run_id = _claimed_implementation_task(conn)
+        metadata = _review_metadata()
+        first = kb.handoff_task_to_review(
+            conn,
+            task_id,
+            body="review body",
+            metadata=metadata,
+            expected_run_id=run_id,
+            expected_profile="instructor",
+        )
+        retry = kb.handoff_task_to_review(
+            conn,
+            task_id,
+            body="ignored after durable success",
+            metadata=metadata,
+            expected_run_id=run_id,
+            expected_profile="instructor",
+        )
+        assert retry.idempotent is True
+        assert retry.handoff_id == first.handoff_id
+        assert len(
+            [
+                event
+                for event in kb.list_events(conn, task_id)
+                if event.kind == "phase_handoff"
+                and event.payload.get("to_step") == "review"
+            ]
+        ) == 1
+
+        conflict = _review_metadata()
+        conflict[field] = replacement
+        with pytest.raises(ValueError, match="different review handoff"):
+            kb.handoff_task_to_review(
+                conn,
+                task_id,
+                body="conflicting retry",
+                metadata=conflict,
+                expected_run_id=run_id,
+                expected_profile="instructor",
+            )
+
+
+def test_review_gate_is_not_promoted_by_dispatcher_automation(kanban_home):
+    with kb.connect() as conn:
+        _, task_id, run_id = _claimed_implementation_task(conn)
+        kb.handoff_task_to_review(
+            conn,
+            task_id,
+            body="review body",
+            metadata=_review_metadata(),
+            expected_run_id=run_id,
+            expected_profile="instructor",
+        )
+        child_id = kb.create_task(
+            conn,
+            title="Wait for human review",
+            assignee="worker",
+            parents=[task_id],
+        )
+
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, task_id)
+        child = kb.get_task(conn, child_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.assignee is None
+        assert child is not None and child.status == "todo"
+        assert kb.claim_task(conn, task_id, claimer="dispatcher:test") is None
+
+
 def test_prepare_planning_reuses_card_and_preserves_durable_state(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="merged dependency", assignee="planner")
