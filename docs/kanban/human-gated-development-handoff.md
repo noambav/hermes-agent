@@ -348,7 +348,11 @@ The bridge is required before the overall workflow is considered complete. Its i
 
 ### Required Phase 1: design the Instructor contract
 
-This is the required Instructor-design project, but it has not started. Before implementation, agree on a written contract covering:
+The approved design is recorded at:
+
+- `docs/superpowers/specs/2026-07-23-instructor-contract-design.md`
+
+That design is documentation only and does not authorize implementation. Before implementation, the contract requires:
 
 - The exact meaning of human Blocked → Ready authorization.
 - Instructor authority and prohibitions.
